@@ -212,9 +212,11 @@ lists, so it plans as a single partition and lets Lance's own index search
 parallelise inside it.
 
 **A write is one transaction.** `LanceDataSink` streams batches into a single
-`Dataset::write`, so a failed write leaves no new dataset version. Lance drives
-its writer from a blocking reader on a background thread, so batches cross over
-through a bounded channel rather than being collected in memory. Spark's four
+`Dataset::write`, so a failed write leaves no new dataset version, and an input
+that fails part way through fails the writer rather than letting it commit the
+rows it has already received. Lance drives its writer from a blocking reader on
+a background thread, so batches cross over through a bounded channel rather than
+being collected in memory. Spark's four
 save modes map onto Lance's create, append and overwrite: `append` creates the
 dataset when it does not exist yet, and `ignore` against an existing dataset
 writes nothing at all.
@@ -246,6 +248,16 @@ metadata, and asserts the result equals the original.
 
 ## Status
 
-This is a proof of concept, not a supported integration. It is tested against
+This is a proof of concept, not a supported integration. It is built against
 Lance at the revision it lives in and Sail at revision `67b3cc5e`, which is
-pinned in `Cargo.toml`.
+pinned in `Cargo.toml`. What has been run:
+
+* `cargo test` here: 34 tests, covering the Arrow bridge, option and filter
+  translation, and the read and write paths end to end through Sail's traits.
+* `cargo clippy --all-targets -- -D warnings` with Sail's lint configuration.
+* `cargo check -p sail-lance --all-targets` and `cargo check -p sail-session`
+  inside a Sail checkout with `scripts/install-into-sail.sh` applied, so both
+  the crate and the registration compile as part of Sail itself.
+
+Not run here: a Sail server against a real Spark client, and anything on object
+storage rather than a local filesystem.

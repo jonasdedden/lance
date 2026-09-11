@@ -6882,7 +6882,6 @@ dependencies = [
  "lance",
  "lance-file",
  "lance-table",
- "object_store",
  "sail-common-datafusion",
  "tempfile",
  "tokio",

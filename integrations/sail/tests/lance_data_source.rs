@@ -605,3 +605,43 @@ async fn a_write_plan_explains_itself() -> Result<()> {
     assert!(explained.contains("LanceDataSink"), "{explained}");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_failing_input_does_not_leave_a_dataset_behind() -> Result<()> {
+    let directory = TempDir::new()?;
+    let uri = dataset_uri(&directory);
+    let ctx = session();
+
+    // Dividing by the zero in the second row fails part way through the write.
+    let ids = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![1, 0])) as ArrayRef],
+    )?;
+    let input = ctx
+        .read_batch(ids)?
+        .select(vec![(lit(10_i64) / col("id")).alias("id")])?
+        .logical_plan()
+        .clone();
+    let plan = LanceDataSource
+        .create_writer(
+            &ctx.state(),
+            SinkInfo {
+                input,
+                mode: SinkMode::ErrorIfExists,
+                partition_by: vec![],
+                bucket_by: None,
+                sort_order: vec![],
+                options: options(&[("path", uri.as_str())]),
+                lakehouse_table: None,
+            },
+        )
+        .await?;
+
+    let error = error_message(DataFrame::new(ctx.state(), plan).collect().await);
+    assert!(error.contains("Divide by zero"), "{error}");
+    assert!(
+        error_message(read(&ctx, &uri, &[]).await).contains("not found"),
+        "a failed write must not commit a dataset"
+    );
+    Ok(())
+}

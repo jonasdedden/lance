@@ -128,23 +128,42 @@ impl DataSink for LanceDataSink {
         });
 
         let mut rows = 0_u64;
+        let mut input_error = None;
         let mut writer_stopped_early = false;
-        while let Some(batch) = data.try_next().await? {
-            rows += batch.num_rows() as u64;
-            // The reader side is an Arrow 58 `RecordBatchReader`, so a
-            // conversion failure has to travel as an Arrow 58 error.
-            let converted = bridge::batch_to_lance(batch, Arc::clone(&schema))
-                .map_err(|e| LanceArrowError::ExternalError(Box::new(e)));
-            if sender.send(converted).await.is_err() {
-                // The writer is gone; the error it failed with is the useful one.
-                writer_stopped_early = true;
-                break;
+        loop {
+            match data.try_next().await {
+                Ok(Some(batch)) => {
+                    rows += batch.num_rows() as u64;
+                    // The reader side is an Arrow 58 `RecordBatchReader`, so a
+                    // conversion failure has to travel as an Arrow 58 error.
+                    let converted = bridge::batch_to_lance(batch, Arc::clone(&schema))
+                        .map_err(|e| LanceArrowError::ExternalError(Box::new(e)));
+                    if sender.send(converted).await.is_err() {
+                        // The writer is gone; the error it failed with is the
+                        // useful one.
+                        writer_stopped_early = true;
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    // Closing the channel here would look like the end of the
+                    // input and commit the rows written so far, so the writer
+                    // is failed on purpose instead.
+                    let _ = sender.send(Err(input_failed(&error))).await;
+                    input_error = Some(error);
+                    break;
+                }
             }
         }
         drop(sender);
-        write
+        let written = write
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))??;
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if let Some(error) = input_error {
+            return Err(error);
+        }
+        written?;
         if writer_stopped_early {
             return plan_err!(
                 "the Lance writer for {} stopped before all rows were written",
@@ -153,6 +172,14 @@ impl DataSink for LanceDataSink {
         }
         Ok(rows)
     }
+}
+
+/// Reports a failed input stream to the Lance writer, so that it aborts
+/// instead of committing the rows it has already received.
+fn input_failed(error: &DataFusionError) -> LanceArrowError {
+    LanceArrowError::ExternalError(Box::new(std::io::Error::other(format!(
+        "the input of the Lance write failed: {error}"
+    ))))
 }
 
 /// Resolves the Lance write mode against the dataset that is already there.
