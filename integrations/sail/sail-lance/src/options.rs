@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Read and write options for the Lance data source.
+//! Read and write options for the Lance table format.
 //!
 //! Option names follow the Apache Spark connector for Lance
 //! (<https://github.com/lance-format/lance-spark>) so that a Spark job keeps
@@ -117,7 +117,7 @@ impl LanceReadOptions {
                 }
                 OptionLayer::AsOfTimestamp { value } => {
                     return not_impl_err!(
-                        "time travel by timestamp ({value}) for the Lance data source; \
+                        "time travel by timestamp ({value}) for the Lance table format; \
                          use a version number or a tag instead"
                     );
                 }
@@ -216,10 +216,10 @@ impl LanceWriteMode {
             SinkMode::ErrorIfExists => Ok(Self::ErrorIfExists),
             SinkMode::IgnoreIfExists => Ok(Self::IgnoreIfExists),
             SinkMode::OverwriteIf { .. } => {
-                not_impl_err!("conditional overwrite for the Lance data source")
+                not_impl_err!("conditional overwrite for the Lance table format")
             }
             SinkMode::OverwritePartitions => {
-                not_impl_err!("dynamic partition overwrite for the Lance data source")
+                not_impl_err!("dynamic partition overwrite for the Lance table format")
             }
         }
     }
@@ -283,11 +283,11 @@ fn normalize_key(key: &str) -> String {
 fn unknown_option(key: &str, strict: bool, supported: &[&str]) -> Result<()> {
     if !strict || RESERVED_OPTIONS.contains(&key) {
         // Catalog properties and the table location travel in the same option
-        // layers as user options and are not addressed to this data source.
+        // layers as user options and are not addressed to this table format.
         return Ok(());
     }
     plan_err!(
-        "unknown option for the Lance data source: '{key}'. Supported options: {}",
+        "unknown option for the Lance table format: '{key}'. Supported options: {}",
         supported.join(", ")
     )
 }

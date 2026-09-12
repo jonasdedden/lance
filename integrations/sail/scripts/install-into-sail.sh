@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 #
-# Installs the Lance data source into a Sail checkout:
+# Installs the Lance table format into a Sail checkout:
 #
-#   1. copies this crate's sources to `crates/sail-lance` in that checkout,
-#      with a manifest that uses Sail's workspace dependencies, and
-#   2. registers the data source and its physical planner with Sail's session.
+#   1. copies the `sail-lance` crate to `crates/sail-lance` in that checkout, and
+#   2. applies `patches/lance-table-format.patch`, which registers the format
+#      with Sail's session and lets Sail's error conversion tolerate the
+#      DataFusion `sql` feature that Lance turns on.
+#
+# The checkout must be at tag v0.7.1, the Sail release built against the same
+# DataFusion and Arrow versions as Lance.
 #
 # Usage: scripts/install-into-sail.sh <path-to-sail-checkout>
 
@@ -19,7 +23,6 @@ fi
 
 sail=$(cd "$1" && pwd)
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-lance=$(cd "${here}/../.." && pwd)
 
 if [[ ! -f "${sail}/crates/sail-session/src/formats.rs" ]]; then
     echo "error: ${sail} does not look like a Sail checkout" >&2
@@ -27,52 +30,16 @@ if [[ ! -f "${sail}/crates/sail-session/src/formats.rs" ]]; then
 fi
 
 crate="${sail}/crates/sail-lance"
+rm -rf "${crate}"
 mkdir -p "${crate}"
-rm -rf "${crate}/src" "${crate}/tests"
-cp -r "${here}/src" "${crate}/src"
-cp -r "${here}/tests" "${crate}/tests"
+cp -r "${here}/sail-lance/." "${crate}/"
 
-# The manifest differs from the standalone one: inside the Sail workspace the
-# Sail crates and their DataFusion and Arrow versions come from the workspace
-# rather than from crates.io and a pinned Git revision.
-cat > "${crate}/Cargo.toml" <<EOF
-[package]
-name = "sail-lance"
-version = { workspace = true }
-edition = { workspace = true }
-
-[dependencies]
-sail-common-datafusion = { path = "../sail-common-datafusion" }
-
-datafusion = { workspace = true }
-datafusion-common = { workspace = true }
-datafusion-expr = { workspace = true }
-arrow = { workspace = true, features = ["ffi"] }
-
-# Lance is built against Arrow 58, which is why it brings its own Arrow.
-lance = { path = "${lance}/rust/lance", default-features = false }
-lance-file = { path = "${lance}/rust/lance-file" }
-lance-table = { path = "${lance}/rust/lance-table" }
-arrow-lance = { package = "arrow", version = "58.3", default-features = false, features = ["ffi"] }
-
-async-trait = { workspace = true }
-futures = { workspace = true }
-tokio = { workspace = true }
-url = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
-
-[lints]
-workspace = true
-EOF
-
-patch="${here}/patches/register-lance-data-source.patch"
+patch="${here}/patches/lance-table-format.patch"
 if git -C "${sail}" apply --check "${patch}" 2>/dev/null; then
     git -C "${sail}" apply "${patch}"
-    echo "registered the Lance data source with sail-session"
+    echo "registered the Lance table format with sail-session"
 else
-    echo "note: ${patch} did not apply; sail-session may already be patched" >&2
+    echo "note: ${patch} did not apply; the checkout may already be patched" >&2
 fi
 
 cat <<EOF

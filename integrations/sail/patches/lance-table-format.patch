@@ -1,0 +1,148 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e8af02f2..8157de09 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -158,6 +158,9 @@ prost-types = "0.14"
+ #   https://github.com/hyperium/tonic/blob/vRELEASE/tonic/Cargo.toml
+ axum = "0.8.9"
+ datafusion = { version = "54.1.0", default-features = false, features = [
++    # Required by any workspace member that depends on a crate needing
++    # DataFusion's SQL front end, such as Lance.
++    "sql",
+     "nested_expressions",
+     "crypto_expressions",
+     "datetime_expressions",
+diff --git a/crates/sail-common-datafusion/src/error.rs b/crates/sail-common-datafusion/src/error.rs
+index a9c1a817..d7ecdef2 100644
+--- a/crates/sail-common-datafusion/src/error.rs
++++ b/crates/sail-common-datafusion/src/error.rs
+@@ -163,6 +163,7 @@ impl CommonErrorCause {
+                 },
+                 DataFusionError::Shared(e) => Self::build::<Py>(e.as_ref(), seen),
+                 DataFusionError::Ffi(x) => Self::Unknown(x.clone()),
++                DataFusionError::SQL(e, _) => Self::Plan(e.to_string()),
+             };
+         }
+ 
+diff --git a/crates/sail-plan/src/resolver/expression/wildcard.rs b/crates/sail-plan/src/resolver/expression/wildcard.rs
+index eb3c5028..5b5a7c37 100644
+--- a/crates/sail-plan/src/resolver/expression/wildcard.rs
++++ b/crates/sail-plan/src/resolver/expression/wildcard.rs
+@@ -1,9 +1,10 @@
+ use std::collections::VecDeque;
+ 
+ use arrow::datatypes::DataType;
++use datafusion::sql::sqlparser::ast::{Ident, IdentWithAlias, ObjectName, ObjectNamePart};
++use datafusion::sql::unparser::Unparser;
+ use datafusion_common::{DFSchemaRef, TableReference};
+ use datafusion_expr::expr::ScalarFunction;
+-use datafusion_expr::sql::{Ident, ObjectName, ObjectNamePart};
+ use datafusion_expr::{ScalarUDF, col, expr, lit};
+ use datafusion_functions::core::get_field;
+ use sail_common::spec;
+@@ -155,10 +156,16 @@ impl PlanResolver<'_> {
+         state: &mut PlanResolverState,
+     ) -> PlanResult<expr::WildcardOptions> {
+         fn make_ident(value: impl Into<String>) -> Ident {
+-            Ident {
+-                value: value.into(),
+-                quote_style: None,
+-                span: String::new(),
++            Ident::new(value)
++        }
++
++        fn make_ident_with_alias(
++            identifier: impl Into<String>,
++            alias: impl Into<String>,
++        ) -> IdentWithAlias {
++            IdentWithAlias {
++                ident: make_ident(identifier),
++                alias: make_ident(alias),
+             }
+         }
+ 
+@@ -219,7 +226,7 @@ impl PlanResolver<'_> {
+                         .resolve_expression(*elem.expression, schema, state)
+                         .await?;
+                     let item = expr::ReplaceSelectElement {
+-                        expr: expression.to_string(),
++                        expr: Unparser::default().expr_to_sql(&expression)?,
+                         column_name: make_ident(elem.column_name),
+                         as_keyword: elem.as_keyword,
+                     };
+@@ -239,21 +246,11 @@ impl PlanResolver<'_> {
+                 let rename = if x.len() > 1 {
+                     expr::RenameSelectItem::Multiple(
+                         x.into_iter()
+-                            .map(|x| {
+-                                format!(
+-                                    "{} AS {}",
+-                                    String::from(x.identifier),
+-                                    String::from(x.alias)
+-                                )
+-                            })
++                            .map(|x| make_ident_with_alias(x.identifier, x.alias))
+                             .collect(),
+                     )
+                 } else if let Some(x) = x.into_iter().next() {
+-                    expr::RenameSelectItem::Single(format!(
+-                        "{} AS {}",
+-                        String::from(x.identifier),
+-                        String::from(x.alias)
+-                    ))
++                    expr::RenameSelectItem::Single(make_ident_with_alias(x.identifier, x.alias))
+                 } else {
+                     return Err(PlanError::invalid(
+                         "exclude columns must have at least one column",
+diff --git a/crates/sail-session/Cargo.toml b/crates/sail-session/Cargo.toml
+index 4715424f..5bbc1bc1 100644
+--- a/crates/sail-session/Cargo.toml
++++ b/crates/sail-session/Cargo.toml
+@@ -20,6 +20,7 @@ sail-catalog-hms = { path = "../sail-catalog-hms" }
+ sail-data-source = { path = "../sail-data-source" }
+ sail-delta-lake = { path = "../sail-delta-lake" }
+ sail-iceberg = { path = "../sail-iceberg" }
++sail-lance = { path = "../sail-lance" }
+ sail-logical-plan = { path = "../sail-logical-plan" }
+ sail-logical-optimizer = { path = "../sail-logical-optimizer" }
+ sail-physical-plan = { path = "../sail-physical-plan" }
+diff --git a/crates/sail-session/src/formats.rs b/crates/sail-session/src/formats.rs
+index daa9bd55..65016761 100644
+--- a/crates/sail-session/src/formats.rs
++++ b/crates/sail-session/src/formats.rs
+@@ -16,6 +16,7 @@ use sail_data_source::formats::socket::SocketTableFormat;
+ use sail_data_source::formats::text::TextTableFormat;
+ use sail_delta_lake::DeltaTableFormat;
+ use sail_iceberg::IcebergTableFormat;
++use sail_lance::LanceTableFormat;
+ 
+ pub fn create_table_format_registry() -> Result<Arc<TableFormatRegistry>> {
+     let registry = Arc::new(TableFormatRegistry::new());
+@@ -42,6 +43,7 @@ fn register_builtin_formats(registry: &Arc<TableFormatRegistry>) -> Result<()> {
+ fn register_external_formats(registry: &Arc<TableFormatRegistry>) -> Result<()> {
+     DeltaTableFormat::register(registry)?;
+     IcebergTableFormat::register(registry)?;
++    LanceTableFormat::register(registry)?;
+ 
+     // Register Python data sources
+     {
+diff --git a/crates/sail-session/src/planner.rs b/crates/sail-session/src/planner.rs
+index ad09ad3c..4702b511 100644
+--- a/crates/sail-session/src/planner.rs
++++ b/crates/sail-session/src/planner.rs
+@@ -42,6 +42,7 @@ use sail_data_source::listing::planner::ListingPhysicalPlanner;
+ use sail_delta_lake::logical::DeltaMetadataAggregateRewriter;
+ use sail_delta_lake::physical::DeltaPhysicalPlanner;
+ use sail_iceberg::IcebergPhysicalPlanner;
++use sail_lance::LancePhysicalPlanner;
+ use sail_logical_plan::barrier::BarrierNode;
+ use sail_logical_plan::map_partitions::MapPartitionsNode;
+ use sail_logical_plan::monotonic_id::MonotonicIdNode;
+@@ -98,6 +99,7 @@ impl QueryPlanner for ExtensionQueryPlanner {
+         let extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+             Arc::new(DeltaPhysicalPlanner),
+             Arc::new(IcebergPhysicalPlanner),
++            Arc::new(LancePhysicalPlanner),
+             Arc::new(SystemTablePhysicalPlanner),
+             Arc::new(ListingPhysicalPlanner),
+             Arc::new(ConsolePhysicalPlanner),

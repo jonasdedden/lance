@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! End to end tests that drive Lance through Sail's `DataSource` interface.
+//! End to end tests that drive Lance through Sail's `TableFormat` interface.
 //!
 //! Every test goes through the entry points Sail uses: `create_writer` for
 //! `df.write.format("lance")` and `create_source` for
 //! `spark.read.format("lance")`. Plans are built with the DataFrame API rather
-//! than SQL because Sail, and therefore this crate, builds DataFusion without
-//! its SQL front end.
+//! than SQL, which is how Sail plans a Spark query.
 
 use std::sync::Arc;
 
@@ -16,20 +15,19 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Float32Type, Schema};
 use async_trait::async_trait;
-use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{TableProvider, source_as_provider};
 use datafusion::execution::context::QueryPlanner;
-use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::{Constraints, Result};
 use datafusion_expr::{LogicalPlan, col, lit};
 use sail_common_datafusion::datasource::{
-    DataSource, DataSourceRegistry, OptionLayer, SinkInfo, SinkMode, SourceInfo,
+    OptionLayer, SinkInfo, SinkMode, SourceInfo, TableFormat, TableFormatRegistry,
 };
-use sail_lance::{LanceDataSource, LancePhysicalPlanner};
+use sail_lance::{LancePhysicalPlanner, LanceTableFormat};
 use tempfile::TempDir;
 
 /// A session that plans the Lance write node, which is what registering
@@ -42,7 +40,7 @@ impl QueryPlanner for LanceQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session: &dyn Session,
+        session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(LancePhysicalPlanner)])
             .create_physical_plan(logical_plan, session)
@@ -121,7 +119,7 @@ async fn write(
         options: options(&items),
         lakehouse_table: None,
     };
-    let plan = LanceDataSource.create_writer(&ctx.state(), info).await?;
+    let plan = LanceTableFormat.create_writer(&ctx.state(), info).await?;
     DataFrame::new(ctx.state(), plan).collect().await?;
     Ok(())
 }
@@ -142,7 +140,7 @@ async fn open(
         options: options(read_options),
         read_case_sensitive: false,
     };
-    let source = LanceDataSource.create_source(&ctx.state(), info).await?;
+    let source = LanceTableFormat.create_source(&ctx.state(), info).await?;
     // Sail requires the source to be a `DefaultTableSource`, which is what this
     // unwraps back into a provider.
     source_as_provider(&source)
@@ -264,8 +262,12 @@ async fn filters_projections_and_limits_reach_the_lance_scan() -> Result<()> {
     assert!(explained.contains("LanceScanExec"), "{explained}");
     // DataFusion splits the conjunction into two filters, and both are pushed.
     assert!(
-        explained.contains("filter=(id > 1) AND (name != 'alan')"),
+        explained.contains("filter=id > Int64(1) AND name != Utf8(\"alan\")"),
         "{explained}"
+    );
+    assert!(
+        !explained.contains("FilterExec"),
+        "an exact pushdown leaves no filter above the scan: {explained}"
     );
     assert!(
         !explained.contains("vector"),
@@ -295,13 +297,14 @@ async fn filters_projections_and_limits_reach_the_lance_scan() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_filter_lance_cannot_evaluate_stays_with_datafusion() -> Result<()> {
+async fn a_scalar_function_filter_is_evaluated_by_the_lance_scan() -> Result<()> {
     let directory = TempDir::new()?;
     let uri = dataset_uri(&directory);
     let ctx = session();
     write(&ctx, &uri, people()?, SinkMode::ErrorIfExists, &[]).await?;
 
-    // `char_length` has no Lance counterpart this crate renders.
+    // The filter is a DataFusion expression, not a rendered string, so a
+    // scalar function goes to Lance with its implementation attached.
     let query = read(&ctx, &uri, &[])
         .await?
         .filter(
@@ -311,8 +314,14 @@ async fn a_filter_lance_cannot_evaluate_stays_with_datafusion() -> Result<()> {
     let explained = displayable(query.clone().create_physical_plan().await?.as_ref())
         .indent(true)
         .to_string();
-    assert!(explained.contains("LanceScanExec"), "{explained}");
-    assert!(!explained.contains("filter="), "{explained}");
+    assert!(
+        explained.contains("filter=character_length(name)"),
+        "{explained}"
+    );
+    assert!(
+        explained.contains("columns=[id]"),
+        "a column only the filter needs is not part of the projection: {explained}"
+    );
 
     let batches = query.collect().await?;
     assert_eq!(int_column(&batches, "id")?, vec![1]);
@@ -414,7 +423,7 @@ async fn an_earlier_dataset_version_can_be_read() -> Result<()> {
         .await?;
     assert_eq!(int_column(&original, "id")?, vec![1]);
 
-    let as_of = LanceDataSource
+    let as_of = LanceTableFormat
         .create_source(
             &ctx.state(),
             SourceInfo {
@@ -542,7 +551,7 @@ async fn unsupported_requests_are_rejected_with_a_clear_error() -> Result<()> {
         options: options(&[]),
         read_case_sensitive: false,
     };
-    let error = error_message(LanceDataSource.create_source(&ctx.state(), info).await);
+    let error = error_message(LanceTableFormat.create_source(&ctx.state(), info).await);
     assert!(error.contains("partition columns"), "{error}");
 
     let missing = error_message(
@@ -561,15 +570,11 @@ async fn unsupported_requests_are_rejected_with_a_clear_error() -> Result<()> {
 }
 
 #[test]
-fn the_data_source_registers_under_the_lance_name() -> Result<()> {
-    let registry = DataSourceRegistry::new();
-    registry.register_data_source(Arc::new(LanceDataSource))?;
+fn the_table_format_registers_under_the_lance_name() -> Result<()> {
+    let registry = TableFormatRegistry::new();
+    LanceTableFormat::register(&registry)?;
 
-    assert_eq!(registry.get_data_source("LANCE")?.name(), "lance");
-    assert!(
-        registry.get_lake_source_if_supported("lance")?.is_none(),
-        "row level operations are not wired into Sail's lake source interface yet"
-    );
+    assert_eq!(registry.get("LANCE")?.name(), "lance");
     Ok(())
 }
 
@@ -579,7 +584,7 @@ async fn a_write_plan_explains_itself() -> Result<()> {
     let uri = dataset_uri(&directory);
     let ctx = session();
     let input = ctx.read_batch(people()?)?.logical_plan().clone();
-    let plan = LanceDataSource
+    let plan = LanceTableFormat
         .create_writer(
             &ctx.state(),
             SinkInfo {
@@ -622,7 +627,7 @@ async fn a_failing_input_does_not_leave_a_dataset_behind() -> Result<()> {
         .select(vec![(lit(10_i64) / col("id")).alias("id")])?
         .logical_plan()
         .clone();
-    let plan = LanceDataSource
+    let plan = LanceTableFormat
         .create_writer(
             &ctx.state(),
             SinkInfo {

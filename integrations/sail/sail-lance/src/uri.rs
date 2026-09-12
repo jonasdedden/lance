@@ -10,11 +10,11 @@ use sail_common_datafusion::datasource::{OptionLayer, find_path_in_options};
 pub fn resolve(paths: &[String], options: &[OptionLayer]) -> Result<String> {
     let path = match paths {
         [] => find_path_in_options(options)
-            .ok_or_else(|| plan_datafusion_err!("missing path for the Lance data source"))?,
+            .ok_or_else(|| plan_datafusion_err!("missing path for the Lance table format"))?,
         [path] => path.clone(),
         paths => {
             return plan_err!(
-                "the Lance data source reads one dataset at a time, got {} paths: [{}]",
+                "the Lance table format reads one dataset at a time, got {} paths: [{}]",
                 paths.len(),
                 paths.join(", ")
             );
@@ -33,10 +33,10 @@ pub fn normalize(path: &str) -> Result<String> {
         return Ok(path.to_string());
     }
     let absolute = std::path::absolute(path).map_err(|e| {
-        plan_datafusion_err!("invalid path for the Lance data source '{path}': {e}")
+        plan_datafusion_err!("invalid path for the Lance table format '{path}': {e}")
     })?;
     absolute.to_str().map(str::to_string).ok_or_else(|| {
-        plan_datafusion_err!("path for the Lance data source is not valid UTF-8: '{path}'")
+        plan_datafusion_err!("path for the Lance table format is not valid UTF-8: '{path}'")
     })
 }
 

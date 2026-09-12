@@ -6,10 +6,10 @@
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Float32Array, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -18,13 +18,12 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
-use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, Result, internal_err, plan_datafusion_err};
+use datafusion_expr::Expr;
 use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance_table::format::Fragment;
 
-use crate::bridge;
 use crate::options::LanceReadOptions;
 
 /// Everything a [`LanceScanExec`] partition needs to build its Lance scanner.
@@ -34,8 +33,9 @@ pub struct LanceScanConfig {
     /// columns such as `_rowid` are not listed here: they are produced by the
     /// scan options instead.
     pub columns: Vec<String>,
-    /// Filter to evaluate inside the scan, as a Lance filter expression.
-    pub filter: Option<String>,
+    /// Filter to evaluate inside the scan. Lance binds and evaluates the
+    /// DataFusion expression itself.
+    pub filters: Vec<Expr>,
     /// Row limit hint. Applied per partition, which is sound because
     /// DataFusion keeps its own limit above the scan.
     pub limit: Option<usize>,
@@ -87,7 +87,7 @@ impl DisplayAs for LanceScanExec {
             self.dataset.version().version,
             self.config.columns.join(", ")
         )?;
-        if let Some(filter) = &self.config.filter {
+        if let Some(filter) = combine_filters(&self.config.filters) {
             write!(f, ", filter={filter}")?;
         }
         if let Some(limit) = self.config.limit {
@@ -111,13 +111,6 @@ impl ExecutionPlan for LanceScanExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
-    ) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -180,8 +173,8 @@ async fn open_scan(
     if !config.columns.is_empty() {
         scanner.project(&config.columns).map_err(lance_error)?;
     }
-    if let Some(filter) = &config.filter {
-        scanner.filter(filter).map_err(lance_error)?;
+    if let Some(filter) = combine_filters(&config.filters) {
+        scanner.filter_expr(filter);
     }
     if let Some(limit) = config.limit {
         let limit = i64::try_from(limit)
@@ -195,7 +188,7 @@ async fn open_scan(
         scanner.with_row_id();
     }
     if let Some(nearest) = &config.options.nearest {
-        let query = arrow_lance::array::Float32Array::from(nearest.query.clone());
+        let query = Float32Array::from(nearest.query.clone());
         scanner
             .nearest(&nearest.column, &query, nearest.k)
             .map_err(lance_error)?;
@@ -209,24 +202,19 @@ async fn open_scan(
     }
 
     let stream = scanner.try_into_stream().await.map_err(lance_error)?;
-    // The schema of a Lance scan does not change between batches, so the
-    // conversion of the schema itself is done once and reused.
-    let mut converted_schema: Option<SchemaRef> = None;
     Ok(stream.map_err(lance_error).map(move |batch| {
-        let batch = batch?;
-        let schema = match &converted_schema {
-            Some(schema) => Arc::clone(schema),
-            None => {
-                let schema: SchemaRef = Arc::new(bridge::schema_to_sail(batch.schema_ref())?);
-                converted_schema = Some(Arc::clone(&schema));
-                schema
-            }
-        };
-        let batch = bridge::batch_to_sail(batch, schema)?;
-        let batch = select_output_columns(batch, &output_schema)?;
+        let batch = select_output_columns(batch?, &output_schema)?;
         output_rows.add(batch.num_rows());
         Ok(batch)
     }))
+}
+
+/// Combines the pushed down filters into the single expression Lance takes.
+fn combine_filters(filters: &[Expr]) -> Option<Expr> {
+    filters
+        .iter()
+        .cloned()
+        .reduce(|left, right| left.and(right))
 }
 
 /// Reorders a scanned batch into the column order DataFusion asked for.
@@ -251,7 +239,7 @@ fn select_output_columns(batch: RecordBatch, output_schema: &SchemaRef) -> Resul
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
     RecordBatch::try_new_with_options(Arc::clone(output_schema), columns, &options)
         .map_err(DataFusionError::from)
 }

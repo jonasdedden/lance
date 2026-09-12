@@ -4,20 +4,20 @@
 //! The logical write node and the planner that turns it into a physical write.
 //!
 //! Sail plans writes through user defined logical nodes rather than
-//! DataFusion's DML statements, so the Lance write follows the same shape: a
-//! [`LanceWriteNode`] produced by the data source, and a [`LancePhysicalPlanner`]
+//! DataFusion's DML statements, which its lint configuration disallows, so the
+//! Lance write follows the same shape: a
+//! [`LanceWriteNode`] produced by the table format, and a [`LancePhysicalPlanner`]
 //! registered alongside Sail's other extension planners.
 
 use std::fmt::Formatter;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use datafusion::catalog::Session;
 use datafusion::datasource::sink::DataSinkExec;
+use datafusion::execution::session_state::SessionState;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_common::{DFSchema, DFSchemaRef, Result, internal_err};
-use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
 
 use crate::options::{LanceWriteMode, LanceWriteOptions};
@@ -110,8 +110,7 @@ impl ExtensionPlanner for LancePhysicalPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session: &dyn Session,
-        _planning_ctx: &PhysicalPlanningContext,
+        _session: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(node) = node.as_any().downcast_ref::<LanceWriteNode>() else {
             return Ok(None);

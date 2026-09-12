@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! The Lance implementation of Sail's [`DataSource`].
+//! The Lance implementation of Sail's [`TableFormat`].
 //!
-//! This is the type Sail's data source registry is given; everything Sail needs
-//! from Lance goes through it.
+//! This is the type Sail's table format registry is given; everything Sail
+//! needs from Lance goes through it.
 
 use std::sync::Arc;
 
@@ -14,33 +14,39 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::provider_as_source;
 use datafusion_common::{Result, not_impl_err, plan_err};
 use datafusion_expr::{Extension, LogicalPlan, TableSource};
-use sail_common_datafusion::datasource::{DataSource, SinkInfo, SourceInfo};
+use sail_common_datafusion::datasource::{SinkInfo, SourceInfo, TableFormat, TableFormatRegistry};
 
 use crate::options::{LanceReadOptions, LanceWriteMode, LanceWriteOptions};
 use crate::provider::LanceTableProvider;
 use crate::uri;
 use crate::write::LanceWriteNode;
 
-/// The `lance` data source.
+/// The `lance` table format.
 ///
-/// Register it with Sail's data source registry to make
+/// Register it with Sail's table format registry to make
 /// `spark.read.format("lance")`, `df.write.format("lance")` and
 /// `CREATE TABLE ... USING lance` work:
 ///
 /// ```
-/// # use std::sync::Arc;
-/// # use sail_common_datafusion::datasource::DataSourceRegistry;
-/// # use sail_lance::LanceDataSource;
-/// # fn register(registry: &DataSourceRegistry) -> datafusion_common::Result<()> {
-/// registry.register_data_source(Arc::new(LanceDataSource))?;
+/// # use sail_common_datafusion::datasource::TableFormatRegistry;
+/// # use sail_lance::LanceTableFormat;
+/// # fn register(registry: &TableFormatRegistry) -> datafusion_common::Result<()> {
+/// LanceTableFormat::register(registry)?;
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Default, Clone, Copy)]
-pub struct LanceDataSource;
+pub struct LanceTableFormat;
+
+impl LanceTableFormat {
+    /// Adds this format to a Sail table format registry.
+    pub fn register(registry: &TableFormatRegistry) -> Result<()> {
+        registry.register(Arc::new(Self))
+    }
+}
 
 #[async_trait]
-impl DataSource for LanceDataSource {
+impl TableFormat for LanceTableFormat {
     fn name(&self) -> &str {
         "lance"
     }
@@ -63,12 +69,12 @@ impl DataSource for LanceDataSource {
         } = info;
         if !partition_by.is_empty() {
             return not_impl_err!(
-                "partition columns for the Lance data source; \
+                "partition columns for the Lance table format; \
                  a Lance dataset is not partitioned by directory"
             );
         }
         if bucket_by.is_some() {
-            return not_impl_err!("bucketing for the Lance data source");
+            return not_impl_err!("bucketing for the Lance table format");
         }
         let uri = uri::resolve(&paths, &options)?;
         let read_options = LanceReadOptions::resolve(&options)?;
@@ -90,13 +96,13 @@ impl DataSource for LanceDataSource {
             lakehouse_table: _,
         } = info;
         if !partition_by.is_empty() {
-            return not_impl_err!("partition columns for the Lance data source");
+            return not_impl_err!("partition columns for the Lance table format");
         }
         if bucket_by.is_some() {
-            return not_impl_err!("bucketing for the Lance data source");
+            return not_impl_err!("bucketing for the Lance table format");
         }
         if !sort_order.is_empty() {
-            return not_impl_err!("write sort order for the Lance data source");
+            return not_impl_err!("write sort order for the Lance table format");
         }
         let uri = uri::resolve(&[], &options)?;
         let write_mode = LanceWriteMode::resolve(&mode)?;

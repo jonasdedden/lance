@@ -17,9 +17,9 @@ use lance::dataset::builder::DatasetBuilder;
 use lance_table::format::Fragment;
 
 use crate::exec::{LanceScanConfig, LanceScanExec, lance_error};
-use crate::filter::{combine_lance_filters, to_lance_filter};
+use crate::filter::is_scan_filter;
 use crate::options::{DatasetRef, LanceReadOptions};
-use crate::{bridge, uri};
+use crate::uri;
 
 /// Columns a Lance scan produces from its options rather than from the dataset
 /// schema, and which therefore must not be pushed into a column projection.
@@ -44,13 +44,12 @@ impl LanceTableProvider {
             scanner.with_row_id();
         }
         if let Some(nearest) = &read_options.nearest {
-            let query = arrow_lance::array::Float32Array::from(nearest.query.clone());
+            let query = arrow::array::Float32Array::from(nearest.query.clone());
             scanner
                 .nearest(&nearest.column, &query, nearest.k)
                 .map_err(lance_error)?;
         }
         let schema = scanner.schema().await.map_err(lance_error)?;
-        let schema = Arc::new(bridge::schema_to_sail(schema.as_ref())?);
         Ok(Self {
             uri: uri.to_string(),
             schema,
@@ -63,13 +62,17 @@ impl LanceTableProvider {
         &self.uri
     }
 
-    /// Renders `expr` as a filter this dataset's scanner accepts.
-    fn lance_filter(&self, expr: &Expr) -> Option<String> {
-        let filter = to_lance_filter(expr)?;
-        // Lance parses and binds the filter against the dataset schema, so let
-        // it have the final word on whether the filter can be pushed down.
-        self.dataset.scan().filter(&filter).ok()?;
-        Some(filter)
+    /// Returns whether a Lance scan can evaluate `expr` for this dataset.
+    ///
+    /// Lance binds the expression against the dataset schema, so it has the
+    /// final word: an expression it cannot bind stays with DataFusion.
+    fn is_pushable(&self, expr: &Expr) -> bool {
+        if !is_scan_filter(expr) {
+            return false;
+        }
+        let mut scanner = self.dataset.scan();
+        scanner.filter_expr(expr.clone());
+        scanner.get_expr_filter().is_ok()
     }
 }
 
@@ -95,13 +98,9 @@ impl TableProvider for LanceTableProvider {
             None => Arc::clone(&self.schema),
         };
         let columns = scan_columns(&output_schema, &self.schema);
-        let filters = filters
-            .iter()
-            .filter_map(|filter| self.lance_filter(filter))
-            .collect::<Vec<_>>();
         let config = LanceScanConfig {
             columns,
-            filter: combine_lance_filters(&filters),
+            filters: filters.to_vec(),
             limit,
             options: self.read_options.clone(),
         };
@@ -125,11 +124,11 @@ impl TableProvider for LanceTableProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if self.lance_filter(filter).is_some() {
-                    // Lance evaluates the filter, and DataFusion evaluates it
-                    // again, so a difference in SQL semantics cannot produce a
-                    // wrong answer.
-                    TableProviderFilterPushDown::Inexact
+                if self.is_pushable(filter) {
+                    // Lance evaluates the same DataFusion expression with the
+                    // same DataFusion version, so the scan output needs no
+                    // second filter above it.
+                    TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }

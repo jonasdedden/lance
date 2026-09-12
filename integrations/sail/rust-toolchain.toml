@@ -1,5 +1,0 @@
-# Sail declares `rust-version = "1.97.1"`, which is newer than the toolchain
-# pinned by the Lance workspace, so this crate pins its own toolchain.
-[toolchain]
-channel = "1.97.1"
-components = ["rustfmt", "clippy"]
