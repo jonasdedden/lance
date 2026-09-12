@@ -177,8 +177,10 @@ cargo clippy -p sail-lance --all-targets -- -D warnings
 cargo run --bin sail -- spark server --port 50051
 ```
 
-To carry it into a Sail fork as a branch, which is where it would live if it
-were upstreamed:
+The same content is pushed as a branch on a Sail fork, which is where it would
+live if it were upstreamed:
+<https://github.com/jonasdedden/sail/tree/claude/sail-lance-compatibility-poc-oaif5t>
+(based on `v0.7.1`). To produce that branch from scratch:
 
 ```bash
 git clone https://github.com/<you>/sail.git && cd sail
