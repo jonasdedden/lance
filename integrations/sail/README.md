@@ -177,6 +177,16 @@ cargo clippy -p sail-lance --all-targets -- -D warnings
 cargo run --bin sail -- spark server --port 50051
 ```
 
+To carry it into a Sail fork as a branch, which is where it would live if it
+were upstreamed:
+
+```bash
+git clone https://github.com/<you>/sail.git && cd sail
+git checkout -b lance-table-format v0.7.1
+/path/to/lance/integrations/sail/scripts/install-into-sail.sh .
+git add -A && git commit -m "feat: add the Lance table format"
+```
+
 The crate is not a member of the Lance workspace and is not built from this
 repository: it is a Sail crate that lives here, and the script is how it gets
 to where it builds. Its tests go through the same entry points Sail uses —
