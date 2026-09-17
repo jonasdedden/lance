@@ -22,13 +22,11 @@ from .dependencies import pandas as pd
 from .dependencies import polars as pl
 
 if TYPE_CHECKING:
-    from .dependencies import datasets, pydantic
+    from pydantic import BaseModel
 
-    # Keep in step with the branches of ``_coerce_reader``: every input coerced
-    # there needs a member here, and every member here needs a branch there.
-    # The container members are the covariant spellings so that, say, a
-    # ``list[MyModel]`` is accepted; ``_coerce_reader`` narrows them to ``dict``
-    # and ``list`` and reports anything else it cannot read.
+    from .dependencies import datasets
+
+    # Keep in step with the branches of ``_coerce_reader``.
     ReaderLike = Union[
         pd.DataFrame,
         pl.DataFrame,
@@ -42,7 +40,7 @@ if TYPE_CHECKING:
         datasets.IterableDataset,
         Mapping[str, Any],
         Sequence[Mapping[str, Any]],
-        Sequence[pydantic.BaseModel],
+        Sequence[BaseModel],
         Iterable[RecordBatch],
     ]
 
@@ -103,8 +101,7 @@ def _is_materialized(data_obj: ReaderLike) -> bool:
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:
-    # Imported here because ``lance.dataset`` imports this module, and because
-    # the ``lance.dataset`` name is also bound to a function in ``lance``.
+    # Local import: ``lance.dataset`` imports this module.
     from .dataset import LanceDataset
 
     if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):

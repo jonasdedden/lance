@@ -162,7 +162,6 @@ if TYPE_CHECKING:
     import numpy
     import pandas
     import polars
-    import pydantic
     import torch  # type: ignore[reportMissingImports]
 else:
     # heavy/optional third party libs
@@ -171,7 +170,7 @@ else:
     polars, _POLARS_AVAILABLE = _lazy_import("polars")
     torch, _TORCH_AVAILABLE = _lazy_import("torch")
     datasets, _HUGGING_FACE_AVAILABLE = _lazy_import("datasets")
-    pydantic, _PYDANTIC_AVAILABLE = _lazy_import("pydantic")
+    _, _PYDANTIC_AVAILABLE = _lazy_import("pydantic")
 
 
 @lru_cache(maxsize=None)
@@ -267,7 +266,6 @@ __all__ = [
     "numpy",
     "pandas",
     "polars",
-    "pydantic",
     "torch",
     # lazy utilities
     "_check_for_hugging_face",

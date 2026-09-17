@@ -26,11 +26,8 @@ from .lance import _Hnsw, _KMeans
 if TYPE_CHECKING:
     from pandas.api.typing import NaTType
 
-    # ``pandas.Timestamp`` is a ``datetime`` subclass, so it needs no member of
-    # its own. ``NaTType`` does: the stubs bundled with pandas declare
-    # ``Timestamp.__new__`` as returning ``Self | NaTType``, so every caller
-    # writing ``asof=pd.Timestamp(...)`` hands us that union. We accept it here
-    # and reject the ``NaT`` half in ``sanitize_ts``.
+    # ``pd.Timestamp`` is a ``datetime``, but pandas types its constructor as
+    # ``Timestamp | NaTType``; ``sanitize_ts`` rejects ``NaT`` at runtime.
     ts_types = Union[datetime, NaTType, str]
 
 MetricType = Literal["l2", "euclidean", "dot", "cosine"]
@@ -57,9 +54,7 @@ def sanitize_ts(ts: ts_types) -> datetime:
                 ) from None
         ts = pd.to_datetime(ts)
     if _check_for_pandas(ts):
-        # pandas spells a missing timestamp ``NaT``, which subclasses ``datetime``
-        # and compares false against every version timestamp, so it would
-        # otherwise be reported as being older than the first version.
+        # ``NaT`` subclasses ``datetime`` but compares false against every version.
         if ts is pd.NaT:
             raise ValueError("NaT is not a valid version timestamp")
         if isinstance(ts, pd.Timestamp):

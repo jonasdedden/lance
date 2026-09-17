@@ -560,27 +560,23 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
-def test_sanitize_ts_parses_strings_with_pandas():
-    # pandas accepts timestamp strings that the pandas-free fallback format
-    # rejects, so a date without a time of day has to work here.
-    assert sanitize_ts("2026-01-01") == datetime(2026, 1, 1)
+@pytest.mark.parametrize(
+    "ts", ["2026-01-01", pd.Timestamp("2026-01-01"), datetime(2026, 1, 1)]
+)
+def test_sanitize_ts(ts):
+    assert sanitize_ts(ts) == datetime(2026, 1, 1)
 
 
-def test_sanitize_ts_rejects_nat():
-    # `NaT` is a `datetime` subclass, so it would otherwise pass through and
-    # compare false against every version timestamp.
-    with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
-        sanitize_ts(pd.NaT)
-
-
-def test_sanitize_ts_rejects_unknown_type():
-    with pytest.raises(TypeError, match="Unrecognized version timestamp"):
-        sanitize_ts(object())
+@pytest.mark.parametrize(
+    "ts,error", [(pd.NaT, ValueError), (object(), TypeError)], ids=["nat", "object"]
+)
+def test_sanitize_ts_rejects(ts, error):
+    with pytest.raises(error):
+        sanitize_ts(ts)
 
 
 def test_sanitize_ts_without_pandas(monkeypatch):
     monkeypatch.setattr("lance.util._PANDAS_AVAILABLE", False)
-
     assert sanitize_ts("2026-01-01 00:00:00") == datetime(2026, 1, 1)
     with pytest.raises(ValueError, match="Try installing Pandas"):
         sanitize_ts("2026-01-01")
