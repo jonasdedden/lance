@@ -800,6 +800,16 @@ impl Planner {
             SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
+            SQLExpr::IsNotDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsNotDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
             SQLExpr::InList {
                 expr,
                 list,
@@ -1685,6 +1695,132 @@ mod tests {
             &BooleanArray::from(vec![
                 true, false, false, true, false, false, true, false, false, true,
             ])
+        );
+    }
+
+    #[test]
+    fn test_sql_is_distinct_from() {
+        use arrow_array::Float64Array;
+
+        // Null-safe equality is never NULL: two NULLs are not distinct, and a
+        // NULL against a value is distinct.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let planner = Planner::new(schema.clone());
+
+        let expr = planner.parse_filter("a IS DISTINCT FROM b").unwrap();
+        assert_eq!(
+            expr,
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("a")),
+                Operator::IsDistinctFrom,
+                Box::new(col("b")),
+            ))
+        );
+        let expr = planner.parse_filter("a IS NOT DISTINCT FROM b").unwrap();
+        assert_eq!(
+            expr,
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("a")),
+                Operator::IsNotDistinctFrom,
+                Box::new(col("b")),
+            ))
+        );
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(2), None])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), None, None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        for (filter, expected) in [
+            (
+                "a IS DISTINCT FROM b",
+                BooleanArray::from(vec![false, true, true, false]),
+            ),
+            (
+                "a IS NOT DISTINCT FROM b",
+                BooleanArray::from(vec![true, false, false, true]),
+            ),
+            (
+                "a IS DISTINCT FROM 1",
+                BooleanArray::from(vec![false, true, true, true]),
+            ),
+            (
+                "a IS NOT DISTINCT FROM 1",
+                BooleanArray::from(vec![true, false, false, false]),
+            ),
+        ] {
+            let logical = planner.parse_filter(filter).unwrap();
+            let logical = planner.optimize_expr(logical).unwrap();
+            let physical = planner.create_physical_expr(&logical).unwrap();
+            let result = physical.evaluate(&batch).unwrap().into_array(4).unwrap();
+            assert_eq!(result.as_ref(), &expected, "unexpected result for {filter}");
+        }
+
+        // Strings use the same null-safe rule.
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema.clone());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])) as ArrayRef],
+        )
+        .unwrap();
+        let logical = planner
+            .optimize_expr(planner.parse_filter("s IS DISTINCT FROM 'a'").unwrap())
+            .unwrap();
+        let physical = planner.create_physical_expr(&logical).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(3).unwrap();
+        assert_eq!(
+            result.as_ref(),
+            &BooleanArray::from(vec![false, true, true])
+        );
+
+        // A zero literal is already corrected by `optimize_expr`: both encodings
+        // match, and a NULL stays decided rather than becoming NULL. Without the
+        // rewrite Arrow's total order would report `-0.0` as distinct from `0.0`.
+        // NaN and column-against-column signed zeros keep Arrow's total-order
+        // answer; this spelling does not fix those.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            true,
+        )]));
+        let planner = Planner::new(schema.clone());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![
+                Some(0.0),
+                Some(-0.0),
+                Some(1.0),
+                None,
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let logical = planner
+            .parse_filter("value IS NOT DISTINCT FROM 0.0")
+            .unwrap();
+        let optimized = planner.optimize_expr(logical).unwrap();
+        let covered = col("value").in_list(vec![lit(-0.0_f64), lit(0.0_f64)], false);
+        assert_eq!(optimized, covered.is_true());
+        let physical = planner.create_physical_expr(&optimized).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(4).unwrap();
+        assert_eq!(
+            result.as_ref(),
+            &BooleanArray::from(vec![true, true, false, false])
+        );
+        let logical = planner
+            .optimize_expr(planner.parse_filter("value IS DISTINCT FROM 0.0").unwrap())
+            .unwrap();
+        let physical = planner.create_physical_expr(&logical).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(4).unwrap();
+        assert_eq!(
+            result.as_ref(),
+            &BooleanArray::from(vec![false, false, true, true])
         );
     }
 
