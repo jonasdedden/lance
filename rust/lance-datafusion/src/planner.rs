@@ -1477,6 +1477,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_filter_boolean_column_against_boolean_expression() {
+        // https://github.com/lance-format/lance/issues/9319
+        // `flag != (id > 0)` must plan like `(id > 0) != flag`: the `0`
+        // belongs to `id > 0` and must not be coerced to `Boolean`.
+        let batch = RecordBatch::try_from_iter([
+            (
+                "flag",
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    None,
+                ])) as ArrayRef,
+            ),
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![Some(1), Some(0), Some(-1), Some(1)])) as ArrayRef,
+            ),
+            (
+                "x",
+                Arc::new(Float32Array::from(vec![
+                    Some(0.5),
+                    Some(2.0),
+                    Some(1.0),
+                    Some(2.0),
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        // flag:        T      F      T      null
+        // (id > 0):    T      F      F      T
+        // xor:         F      F      T      null
+        let expected = BooleanArray::from(vec![Some(false), Some(false), Some(true), None]);
+        for filter in ["flag != (id > 0)", "(id > 0) != flag", "flag <> (id > 0)"] {
+            let expr = planner.parse_filter(filter).unwrap();
+            let physical_expr = planner.create_physical_expr(&expr).unwrap();
+            let predicates = physical_expr.evaluate(&batch).unwrap();
+            assert_eq!(
+                predicates.into_array(0).unwrap().as_ref(),
+                &expected,
+                "wrong rows for {filter}",
+            );
+        }
+
+        // flag:              T      F      T      null
+        // (id > 0 AND x > 1): F     F      F      T
+        // xor:               T      F      T      null
+        let expected_and = BooleanArray::from(vec![Some(true), Some(false), Some(true), None]);
+        for filter in [
+            "flag != ((id > 0) AND (x > 1.0))",
+            "((id > 0) AND (x > 1.0)) != flag",
+        ] {
+            let expr = planner.parse_filter(filter).unwrap();
+            let physical_expr = planner.create_physical_expr(&expr).unwrap();
+            let predicates = physical_expr.evaluate(&batch).unwrap();
+            assert_eq!(
+                predicates.into_array(0).unwrap().as_ref(),
+                &expected_and,
+                "wrong rows for {filter}",
+            );
+        }
+
+        // Equality is the negation: T, T, F, null.
+        let expected_eq = BooleanArray::from(vec![Some(true), Some(true), Some(false), None]);
+        for filter in ["flag = (id > 0)", "(id > 0) = flag"] {
+            let expr = planner.parse_filter(filter).unwrap();
+            let physical_expr = planner.create_physical_expr(&expr).unwrap();
+            let predicates = physical_expr.evaluate(&batch).unwrap();
+            assert_eq!(
+                predicates.into_array(0).unwrap().as_ref(),
+                &expected_eq,
+                "wrong rows for {filter}",
+            );
+        }
+    }
+
     #[rstest]
     #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
     #[case::left(

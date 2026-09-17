@@ -26,6 +26,20 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     }
 }
 
+/// Whether a binary operator combines numeric values, so that literals inside
+/// it belong to the surrounding comparison's column type (e.g. `x = 1 + 2`).
+///
+/// Any other operator already types its own operands: comparisons and `AND`/`OR`
+/// produce booleans whose inner literals belong to their own columns. Descending
+/// into such an expression would coerce those literals to the wrong type (e.g.
+/// the `0` in `flag != (id > 0)` to `Boolean`).
+fn is_arithmetic(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::Plus | Operator::Minus | Operator::Multiply | Operator::Divide | Operator::Modulo
+    )
+}
+
 /// A simple helper function that interprets an Expr as a string scalar
 /// or returns None if it is not.
 pub fn get_as_string_scalar_opt(expr: &Expr) -> Option<&str> {
@@ -111,14 +125,24 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                         right: Box::new(resolve_value(right.as_ref(), &left_type)?),
                     })),
                     // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
-                    Expr::BinaryExpr(r) => Ok(Expr::BinaryExpr(BinaryExpr {
+                    // Only arithmetic takes the column's type; an already-typed
+                    // expression (a comparison, AND/OR, ...) is resolved on its
+                    // own so its literals keep their own types.
+                    Expr::BinaryExpr(r) if is_arithmetic(&r.op) => {
+                        Ok(Expr::BinaryExpr(BinaryExpr {
+                            left: left.clone(),
+                            op: *op,
+                            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                                left: coerce_expr(&r.left, &left_type).map(Box::new)?,
+                                op: r.op,
+                                right: coerce_expr(&r.right, &left_type).map(Box::new)?,
+                            })),
+                        }))
+                    }
+                    Expr::BinaryExpr(_) => Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
-                        right: Box::new(Expr::BinaryExpr(BinaryExpr {
-                            left: coerce_expr(&r.left, &left_type).map(Box::new)?,
-                            op: r.op,
-                            right: coerce_expr(&r.right, &left_type).map(Box::new)?,
-                        })),
+                        right: Box::new(resolve_expr(right.as_ref(), schema)?),
                     })),
                     _ => Ok(expr.clone()),
                 }
@@ -126,6 +150,14 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 match left.as_ref() {
                     Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(resolve_value(left.as_ref(), &right_type)?),
+                        op: *op,
+                        right: right.clone(),
+                    })),
+                    // Mirror of the left-hand case above: an already-typed
+                    // expression keeps its own literals (e.g. `(id > 0) != flag`
+                    // must not touch the `0`).
+                    Expr::BinaryExpr(_) => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(resolve_expr(left.as_ref(), schema)?),
                         op: *op,
                         right: right.clone(),
                     })),
@@ -170,11 +202,15 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
 /// - *dtype*: a lance data type
 pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Ok(Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(coerce_expr(left, dtype)?),
-            op: *op,
-            right: Box::new(coerce_expr(right, dtype)?),
-        })),
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_arithmetic(op) => {
+            Ok(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(coerce_expr(left, dtype)?),
+                op: *op,
+                right: Box::new(coerce_expr(right, dtype)?),
+            }))
+        }
+        // An already-typed expression keeps its own literals.
+        Expr::BinaryExpr(_) => Ok(expr.clone()),
         literal_expr @ Expr::Literal(..) => Ok(resolve_value(literal_expr, dtype)?),
         _ => Ok(expr.clone()),
     }
@@ -351,6 +387,124 @@ mod tests {
                     assert_eq!(
                         r_be.right.as_ref(),
                         &Expr::Literal(ScalarValue::Float64(Some(-1.0)), None)
+                    );
+                }
+                _ => panic!("Expected BinaryExpr"),
+            },
+            _ => panic!("Expected BinaryExpr"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_boolean_comparison_with_boolean_expression() {
+        // https://github.com/lance-format/lance/issues/9319
+        // A boolean column compared against a boolean expression must not
+        // coerce the literals inside that expression to `Boolean`.
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("id", DataType::Int64, true),
+            Field::new("x", DataType::Float64, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let int_cmp = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column("id".to_string().into())),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int64(Some(0)), None)),
+        });
+        let float_cmp = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column("x".to_string().into())),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Float64(Some(1.0)), None)),
+        });
+        let flag = Expr::Column("flag".to_string().into());
+
+        // Equality and inequality, with an integer or float literal nested
+        // inside the right-hand comparison.
+        for op in [Operator::Eq, Operator::NotEq] {
+            for cmp in [&int_cmp, &float_cmp] {
+                let expr = Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(flag.clone()),
+                    op,
+                    right: Box::new(cmp.clone()),
+                });
+                let resolved = resolve_expr(&expr, &schema).unwrap();
+                match &resolved {
+                    Expr::BinaryExpr(be) => assert_eq!(be.right.as_ref(), cmp),
+                    other => panic!("expected outer BinaryExpr, got {other:?}"),
+                }
+
+                // Reversed orientation resolves to the same typed expression.
+                let reversed = Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(cmp.clone()),
+                    op,
+                    right: Box::new(flag.clone()),
+                });
+                let resolved = resolve_expr(&reversed, &schema).unwrap();
+                match &resolved {
+                    Expr::BinaryExpr(be) => assert_eq!(be.left.as_ref(), cmp),
+                    other => panic!("expected outer BinaryExpr, got {other:?}"),
+                }
+            }
+        }
+
+        // A conjunction of comparisons on the right keeps every inner literal.
+        let conjunction = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(int_cmp),
+            op: Operator::And,
+            right: Box::new(float_cmp),
+        });
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(flag.clone()),
+            op: Operator::NotEq,
+            right: Box::new(conjunction),
+        });
+        let resolved = resolve_expr(&expr, &schema).unwrap();
+        match &resolved {
+            Expr::BinaryExpr(be) => match be.right.as_ref() {
+                Expr::BinaryExpr(inner) => {
+                    assert!(matches!(inner.op, Operator::And));
+                }
+                other => panic!("expected inner conjunction, got {other:?}"),
+            },
+            other => panic!("expected outer BinaryExpr, got {other:?}"),
+        }
+
+        // A bare boolean literal still coerces against a boolean column.
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(flag),
+            op: Operator::NotEq,
+            right: Box::new(Expr::Literal(ScalarValue::Boolean(Some(true)), None)),
+        });
+        assert_eq!(resolve_expr(&expr, &schema).unwrap(), expr);
+    }
+
+    #[test]
+    fn test_resolve_arithmetic_expression_still_coerces() {
+        // The narrow fix above must not drop the arithmetic case it replaces:
+        // `x = 1 + 2` coerces the literals to the column's type.
+        let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column("a".to_string().into())),
+            op: Operator::Eq,
+            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Literal(ScalarValue::Int64(Some(1)), None)),
+                op: Operator::Plus,
+                right: Box::new(Expr::Literal(ScalarValue::Int64(Some(2)), None)),
+            })),
+        });
+        let resolved = resolve_expr(&expr, &schema).unwrap();
+        match resolved {
+            Expr::BinaryExpr(be) => match be.right.as_ref() {
+                Expr::BinaryExpr(r_be) => {
+                    assert_eq!(
+                        r_be.left.as_ref(),
+                        &Expr::Literal(ScalarValue::Float64(Some(1.0)), None)
+                    );
+                    assert_eq!(
+                        r_be.right.as_ref(),
+                        &Expr::Literal(ScalarValue::Float64(Some(2.0)), None)
                     );
                 }
                 _ => panic!("Expected BinaryExpr"),
