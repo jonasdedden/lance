@@ -464,6 +464,39 @@ Lance internally stores data in Arrow format. The mapping from SQL types to Arro
 
 (1) See precision mapping in previous table.
 
+### Typed filter expressions
+
+Hand-written SQL strings are parsed without any knowledge of the
+caller's intent. An integer column compared with a fractional literal
+fails to plan, a double-typed literal against a `Float32` column casts
+the column and skips its scalar index, and a boolean column compared
+with a boolean expression fails in one operand order but not the other.
+The `lance.filter` module builds the same predicates from typed
+expressions instead:
+
+```python
+import lance
+from lance.filter import col
+
+ds = lance.dataset("data.lance")
+tbl = ds.scanner(filter=(col("i") > 1.5) & col("s").starts_with("a")).to_table()
+```
+
+An expression passed to `scanner` (also `to_table`, `count_rows`,
+`delete`, and `update`) is rendered to SQL against the dataset schema.
+Fractional comparisons against integer columns become the equivalent
+integer bound (`i > 1.5` becomes `i > 1`), literals against `Float32`
+columns are spelled `CAST(<literal> AS float)` so indexed scans keep
+using the index, and boolean-versus-boolean comparisons plan in either
+operand order. Rendering the same expression with `lance.filter.to_sql`
+without a schema is best-effort and cannot apply these rules.
+
+This is a prototype: it covers comparisons, boolean logic, null and
+NaN tests, `IN`, `BETWEEN`, basic arithmetic, and a few string
+functions. Division, modulo, timezone-aware timestamps, decimals, and
+binary data raise `lance.filter.FilterError` instead of guessing.
+Float filters need at least `pylance 12.0.0b7`.
+
 ### Random read
 
 One distinct feature of Lance, as columnar format, is that it allows you to read random samples quickly.

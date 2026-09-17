@@ -5,7 +5,7 @@
 """Tests for predicate pushdown"""
 
 import random
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,6 +17,7 @@ import pandas.testing as tm
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.filter import FilterError, col, lit, to_sql
 from lance.vector import vec_to_table
 
 
@@ -424,3 +425,313 @@ def test_filter_depth_limit():
     with pytest.raises(ValueError, match="the filter expression is too long"):
         filter = " AND ".join([f"{column_name} = {i}" for i in range(501)])
         ds.to_table(filter=filter)
+
+
+# ---------------------------------------------------------------------------
+# `lance.filter` typed builder (prototype): expressions render to SQL against
+# the dataset schema, applying index-preserving literal rules instead of
+# relying on hand-written SQL strings.
+# ---------------------------------------------------------------------------
+
+
+def _typed_table():
+    return pa.table(
+        {
+            "id": list(range(12)),
+            "i": pa.array(
+                [None, -3, -1, 0, 1, 2, 3, 100, -100, 7, 8, 9], type=pa.int64()
+            ),
+            "f": pa.array(
+                [
+                    None,
+                    -0.0,
+                    0.0,
+                    -1.5,
+                    1.5,
+                    float("inf"),
+                    float("-inf"),
+                    2.0,
+                    -2.0,
+                    0.5,
+                    100.0,
+                    -100.0,
+                ],
+                type=pa.float64(),
+            ),
+            "f32": pa.array(
+                [
+                    None,
+                    -0.0,
+                    0.0,
+                    -1.5,
+                    1.5,
+                    float("inf"),
+                    float("-inf"),
+                    2.0,
+                    -2.0,
+                    0.5,
+                    100.0,
+                    -100.0,
+                ],
+                type=pa.float32(),
+            ),
+            "s": pa.array(
+                [
+                    None,
+                    "apple",
+                    "apricot",
+                    "banana",
+                    "Apple",
+                    "",
+                    "app",
+                    "x",
+                    "application",
+                    "ban",
+                    "a",
+                    "apples",
+                ],
+                type=pa.string(),
+            ),
+            "flag": pa.array(
+                [
+                    None,
+                    True,
+                    False,
+                    True,
+                    False,
+                    True,
+                    False,
+                    True,
+                    False,
+                    True,
+                    False,
+                    True,
+                ],
+                type=pa.bool_(),
+            ),
+            "st": pa.array(
+                [{"x": x, "y": f"n{x}"} for x in range(12)],
+                type=pa.struct([pa.field("x", pa.int64()), pa.field("y", pa.string())]),
+            ),
+            "d": pa.array([date(2021, 1, 1) + timedelta(days=x) for x in range(12)]),
+            "ts": pa.array(
+                [datetime(2021, 1, 1) + timedelta(hours=x) for x in range(12)],
+                type=pa.timestamp("us"),
+            ),
+        }
+    )
+
+
+@pytest.fixture()
+def typed_dataset(tmp_path):
+    import lance
+
+    ds = lance.write_dataset(_typed_table(), tmp_path / "typed.lance")
+    ds.create_scalar_index("i", "BTREE")
+    ds.create_scalar_index("f32", "BTREE")
+    ds.create_scalar_index("s", "BTREE")
+    return lance.dataset(tmp_path / "typed.lance")
+
+
+def _ids(table):
+    return sorted(table["id"].to_pylist())
+
+
+def test_typed_filter_sql_spellings():
+    schema = _typed_table().schema
+    # Fractional literals against an integer column become integer bounds.
+    assert to_sql(col("i") > 1.5, schema) == "(`i` > 1)"
+    assert to_sql(col("i") >= 1.5, schema) == "(`i` >= 2)"
+    assert to_sql(col("i") < 1.5, schema) == "(`i` < 2)"
+    assert to_sql(col("i") <= 1.5, schema) == "(`i` <= 1)"
+    assert to_sql(lit(1.5) < col("i"), schema) == "(`i` > 1)"
+    assert to_sql(col("i") == 2.0, schema) == "(`i` = 2)"
+    assert to_sql(col("i") == 1.5, schema) == "CAST(NULL AS boolean)"
+    assert to_sql(col("i") != 1.5, schema) == "(`i` IS NOT NULL)"
+    # Float literals against Float32 spell the width, keeping the index.
+    assert to_sql(col("f32") > 0.5, schema) == "(`f32` > CAST(0.5 AS float))"
+    assert to_sql(col("f32") == 2, schema) == "(`f32` = CAST(2 AS float))"
+    assert to_sql(col("f") > 0.5, schema) == "(`f` > 0.5)"
+    # Boolean logic between two computed sides plans in either order.
+    assert to_sql(col("flag") != (col("i") > 0), schema) == (
+        "((`flag` AND NOT ((`i` > 0))) OR ((NOT (`flag`)) AND ((`i` > 0))))"
+    )
+    # Empty membership keeps no row; its negation keeps the non-null rows.
+    assert to_sql(col("i").isin([]), schema) == "CAST(NULL AS boolean)"
+    assert to_sql(~col("i").isin([]), schema) == "(`i` IS NOT NULL)"
+    # Literal filters: `TRUE` keeps every row, and negating `FALSE`
+    # keeps every row rather than none (`NOT NULL` would keep none).
+    assert to_sql(lit(True), schema) == "TRUE"
+    assert to_sql(~lit(False), schema) == "TRUE"
+    assert to_sql(~lit(True), schema) == "CAST(NULL AS boolean)"
+    # Paths and string literals are quoted.
+    assert to_sql(col("st.x") > 5, schema) == "(`st`.`x` > 5)"
+    assert to_sql(col("s") == "o'Brien", schema) == "(`s` = 'o''Brien')"
+    assert to_sql(col("d") == date(2021, 1, 5), schema) == "(`d` = date '2021-01-05')"
+
+
+def test_typed_filter_int_float(typed_dataset):
+    cases = [
+        (col("i") == 2, [5], [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]),
+        (col("i") > 1.5, [5, 6, 7, 9, 10, 11], [1, 2, 3, 4, 8]),
+        (col("i") >= 1.5, [5, 6, 7, 9, 10, 11], [1, 2, 3, 4, 8]),
+        (col("i") < 1.5, [1, 2, 3, 4, 8], [5, 6, 7, 9, 10, 11]),
+        (col("i") <= 1.5, [1, 2, 3, 4, 8], [5, 6, 7, 9, 10, 11]),
+        (col("i") == 2.0, [5], [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]),
+        (col("i") == 1.5, [], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (col("i") != 1.5, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], []),
+        (col("i") > float("inf"), [], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (col("i") < float("inf"), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], []),
+        (lit(1.5) < col("i"), [5, 6, 7, 9, 10, 11], [1, 2, 3, 4, 8]),
+        (col("f") == 0.0, [1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (col("f") == 0, [1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (col("f") > 1, [4, 5, 7, 10], [1, 2, 3, 6, 8, 9, 11]),
+        (col("f32") > 0.5, [4, 5, 7, 10], [1, 2, 3, 6, 8, 9, 11]),
+        (col("f32") == 2, [7], [1, 2, 3, 4, 5, 6, 8, 9, 10, 11]),
+    ]
+    for expr, want, want_not in cases:
+        assert _ids(typed_dataset.to_table(columns=["id"], filter=expr)) == want
+        assert _ids(typed_dataset.to_table(columns=["id"], filter=~expr)) == want_not
+
+
+def test_typed_filter_float32_uses_index(typed_dataset):
+    plan = typed_dataset.scanner(
+        columns=["id"], filter=(col("f32") > 0.5)
+    ).explain_plan()
+    assert "ScalarIndexQuery" in plan
+    # The same value hand-spelled as a double casts the column instead.
+    raw_plan = typed_dataset.scanner(
+        columns=["id"], filter="f32 > CAST(0.5 AS double)"
+    ).explain_plan()
+    assert "ScalarIndexQuery" not in raw_plan
+    # The integer-bound rewrite of a fractional comparison stays indexed too.
+    assert (
+        "ScalarIndexQuery"
+        in typed_dataset.scanner(columns=["id"], filter=(col("i") > 1.5)).explain_plan()
+    )
+
+
+def test_typed_filter_bool_expr(typed_dataset):
+    expected = [1, 3, 4, 6, 10]
+    expected_not = [2, 5, 7, 8, 9, 11]
+    for expr in (col("flag") != (col("i") > 0), (col("i") > 0) != col("flag")):
+        assert _ids(typed_dataset.to_table(columns=["id"], filter=expr)) == expected
+        assert (
+            _ids(typed_dataset.to_table(columns=["id"], filter=~expr)) == expected_not
+        )
+    both = col("flag") == (col("i") > 0)
+    assert _ids(typed_dataset.to_table(columns=["id"], filter=both)) == expected_not
+    assert _ids(typed_dataset.to_table(columns=["id"], filter=~both)) == expected
+
+
+def test_typed_filter_membership(typed_dataset):
+    cases = [
+        (col("i").isin([2, 3, 100]), [5, 6, 7], [1, 2, 3, 4, 8, 9, 10, 11]),
+        (col("i").isin([]), [], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (col("i").isin([2, None]), [5], [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]),
+        (col("i").isin([2, 1.5]), [5], [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]),
+        (col("f32").isin([1.5, 2]), [4, 7], [1, 2, 3, 5, 6, 8, 9, 10, 11]),
+        (col("i").between(1, 3), [4, 5, 6], [1, 2, 3, 7, 8, 9, 10, 11]),
+        (col("i").between(1.5, 3.0), [5, 6], [1, 2, 3, 4, 7, 8, 9, 10, 11]),
+    ]
+    for expr, want, want_not in cases:
+        assert _ids(typed_dataset.to_table(columns=["id"], filter=expr)) == want
+        assert _ids(typed_dataset.to_table(columns=["id"], filter=~expr)) == want_not
+    plan = typed_dataset.scanner(
+        columns=["id"], filter=col("i").isin([1, 2])
+    ).explain_plan()
+    assert "ScalarIndexQuery" in plan
+
+
+def test_typed_filter_nested_strings_temporal(typed_dataset):
+    cases = [
+        (col("st.x") > 5, [6, 7, 8, 9, 10, 11], [0, 1, 2, 3, 4, 5]),
+        (col("st").field("x") > 5, [6, 7, 8, 9, 10, 11], [0, 1, 2, 3, 4, 5]),
+        (
+            col("s").starts_with("app"),
+            [1, 6, 8, 11],
+            [2, 3, 4, 5, 7, 9, 10],
+        ),
+        (col("s").ends_with("e"), [1, 4], [2, 3, 5, 6, 7, 8, 9, 10, 11]),
+        (col("s").contains("nan"), [3], [1, 2, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (
+            col("d") == date(2021, 1, 5),
+            [4],
+            [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
+        ),
+        (
+            col("ts") == datetime(2021, 1, 1, 5),
+            [5],
+            [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11],
+        ),
+        (col("i").is_null(), [0], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (col("i").is_not_null(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [0]),
+        ((col("i") + 1) > 2, [5, 6, 7, 9, 10, 11], [1, 2, 3, 4, 8]),
+        (col("flag"), [1, 3, 5, 7, 9, 11], [2, 4, 6, 8, 10]),
+    ]
+    for expr, want, want_not in cases:
+        assert _ids(typed_dataset.to_table(columns=["id"], filter=expr)) == want
+        assert _ids(typed_dataset.to_table(columns=["id"], filter=~expr)) == want_not
+
+
+def test_typed_filter_narrow_int_ranges(tmp_path):
+    import lance
+
+    table = pa.table(
+        {
+            "id": list(range(6)),
+            "b": pa.array([None, -128, -1, 0, 100, 127], type=pa.int8()),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path / "narrow.lance")
+    cases = [
+        # A vacuous high bound clamps instead of declining or mismatching.
+        (col("b").between(1, 1000), [4, 5], [1, 2, 3]),
+        (col("b").between(-1000, -2), [1], [2, 3, 4, 5]),
+        # An unsatisfiable range keeps no row; its negation keeps the
+        # non-null rows. Null rows are kept by neither.
+        (col("b").between(1000, 2000), [], [1, 2, 3, 4, 5]),
+        # Out-of-range needles match no row in either membership position.
+        (col("b").isin([1000, 100]), [4], [1, 2, 3, 5]),
+    ]
+    for expr, want, want_not in cases:
+        got = sorted(ds.to_table(columns=["id"], filter=expr)["id"].to_pylist())
+        assert got == want
+        got_not = sorted(ds.to_table(columns=["id"], filter=~expr)["id"].to_pylist())
+        assert got_not == want_not
+
+
+def test_typed_filter_count_and_delete(tmp_path):
+    import lance
+
+    ds = lance.write_dataset(_typed_table(), tmp_path / "count.lance")
+    assert ds.count_rows(filter=(col("i") > 1.5)) == 6
+    ds.delete(col("i") > 1.5)
+    assert ds.count_rows() == 6
+    assert ds.count_rows(filter=(col("i") > 1.5)) == 0
+    ds.update({"i": "i + 10"}, where=(col("i") == 1))
+    assert ds.count_rows(filter=(col("i") == 11)) == 1
+
+
+def test_typed_filter_errors(typed_dataset):
+    schema = typed_dataset.schema
+    with pytest.raises(FilterError, match="unknown column"):
+        to_sql(col("missing") > 1, schema)
+    with pytest.raises(FilterError, match="unknown field"):
+        to_sql(col("st.nope") > 1, schema)
+    with pytest.raises(FilterError, match="is boolean"):
+        to_sql(col("flag") > 1, schema)
+    with pytest.raises(FilterError, match="out of range"):
+        to_sql(col("i") == 2**70, schema)
+    with pytest.raises(FilterError, match="NaN"):
+        lit(float("nan"))
+    with pytest.raises(FilterError, match="division"):
+        col("i") / 2
+    with pytest.raises(FilterError, match="modulo"):
+        col("i") % 2
+    with pytest.raises(FilterError, match="timezone-aware"):
+        lit(datetime(2021, 1, 1, tzinfo=timezone.utc))
+    with pytest.raises(FilterError, match="not a boolean filter"):
+        to_sql(col("i") + 1, schema)
+    with pytest.raises(FilterError, match="takes a string"):
+        to_sql(col("i").starts_with("a"), schema)

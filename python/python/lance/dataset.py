@@ -54,6 +54,8 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
+from .filter import Expr as FilterExpr
+from .filter import to_sql as filter_to_sql
 from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
@@ -1222,7 +1224,14 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         filter: Optional[
-            Union[str, Expression, FullTextQuery, VectorSearchQuery, Dict[str, Any]]
+            Union[
+                str,
+                Expression,
+                FilterExpr,
+                FullTextQuery,
+                VectorSearchQuery,
+                Dict[str, Any],
+            ]
         ] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
@@ -1263,11 +1272,13 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
-        filter: pa.compute.Expression, str, VectorSearchQuery, FullTextQuery or dict
+        filter: pa.compute.Expression, str, lance.filter.Expr,
+            VectorSearchQuery, FullTextQuery or dict
             Lance supports 2 kinds of filters: expression filter and search filter.
 
-            - Expression filter is pa.compute.Expression or str that is a valid SQL
-             where clause. See `Lance filter pushdown
+            - Expression filter is pa.compute.Expression, lance.filter.Expr
+             (rendered to SQL against the dataset schema) or str that is
+             a valid SQL where clause. See `Lance filter pushdown
              <https://lance.org/guide/read_and_write/#filter-push-down>`_
              for valid SQL expressions. Expression filter is applied to filtered scan,
              full text search and vector search.
@@ -2598,7 +2609,7 @@ class LanceDataset(pa.dataset.Dataset):
             The total number of rows in the dataset.
 
         """
-        if isinstance(filter, pa.compute.Expression):
+        if isinstance(filter, (pa.compute.Expression, FilterExpr)):
             # TODO: consolidate all to use scanner
             return self.scanner(
                 columns=[], with_row_id=True, filter=filter
@@ -2920,7 +2931,9 @@ class LanceDataset(pa.dataset.Dataset):
         >>> dataset.delete("a = 1 or b in ('a', 'b')")
         {'num_deleted_rows': 2}
         """
-        if isinstance(predicate, pa.compute.Expression):
+        if isinstance(predicate, FilterExpr):
+            predicate = filter_to_sql(predicate, self.schema)
+        elif isinstance(predicate, pa.compute.Expression):
             predicate = str(predicate)
         return self._ds.delete(predicate, conflict_retries, retry_timeout)
 
@@ -3125,7 +3138,9 @@ class LanceDataset(pa.dataset.Dataset):
         1  4  b
         2  5  c
         """
-        if isinstance(where, pa.compute.Expression):
+        if isinstance(where, FilterExpr):
+            where = filter_to_sql(where, self.schema)
+        elif isinstance(where, pa.compute.Expression):
             where = str(where)
         return self._ds.update(
             updates,
@@ -6923,14 +6938,21 @@ class ScannerBuilder:
     def filter(
         self,
         filter: Union[
-            str, pa.compute.Expression, FullTextQuery, VectorSearchQuery, dict
+            str,
+            pa.compute.Expression,
+            FilterExpr,
+            FullTextQuery,
+            VectorSearchQuery,
+            dict,
         ],
     ) -> ScannerBuilder:
         """
         Add a filter to the scanner.
 
         :param filter: The filter to apply.  This can be a string, a pyarrow compute
-            expression, a FullTextQuery, a VectorSearchQuery, or a dictionary.
+            expression, a typed ``lance.filter`` expression (rendered against
+            the dataset schema), a FullTextQuery, a VectorSearchQuery,
+            or a dictionary.
 
         :return: The scanner builder.
         """
@@ -6940,6 +6962,8 @@ class ScannerBuilder:
             self._search_filter = PySearchFilter.from_vector_search_query(filter.inner)
         elif isinstance(filter, str):
             self._filter = filter
+        elif isinstance(filter, FilterExpr):
+            self._filter = filter_to_sql(filter, self.ds.schema)
         elif isinstance(filter, pa.compute.Expression):
             try:
                 from pyarrow.substrait import serialize_expressions
