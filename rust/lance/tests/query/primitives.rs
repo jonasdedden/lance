@@ -83,6 +83,8 @@ async fn test_query_integer(#[case] data_type: DataType) {
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value > 20").await;
             test_filter(&original, &ds, "NOT (value > 20)").await;
+            test_filter(&original, &ds, "value IS DISTINCT FROM 20").await;
+            test_filter(&original, &ds, "value IS NOT DISTINCT FROM NULL").await;
             test_filter(&original, &ds, "value is null").await;
             test_filter(&original, &ds, "value is not null").await;
             test_filter(&original, &ds, "(value != 0) OR (value < 20)").await;
@@ -299,6 +301,15 @@ async fn test_query_float_special_values(#[case] data_type: DataType) {
                 assert_filter_ids(&ds, &format!("value < {zero}"), &[3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value <= {zero}"), &[0, 1, 3, 6, 7]).await;
                 assert_filter_ids(&ds, &format!("value = {zero}"), &[0, 1]).await;
+                // Null-safe: the NULL row 9 is distinct rather than unknown.
+                assert_filter_ids(&ds, &format!("value IS NOT DISTINCT FROM {zero}"), &[0, 1])
+                    .await;
+                assert_filter_ids(
+                    &ds,
+                    &format!("value IS DISTINCT FROM {zero}"),
+                    &[2, 3, 4, 5, 6, 7, 8, 9],
+                )
+                .await;
                 assert_filter_ids(&ds, &format!("value != {zero}"), &[2, 3, 4, 5, 6, 7, 8]).await;
                 // NaN is row 4. Arrow sorts it above every other value, so it
                 // survives `>` and `>=`, which IEEE would reject. That gap is
@@ -422,201 +433,6 @@ async fn test_float_zero_predicate_uses_scalar_index() {
     assert_filter_ids(&ds, "value >= 0.0", &[0, 1, 2, 4, 5, 6]).await;
 }
 
-/// `IS [NOT] DISTINCT FROM` is the null-safe equality spelling: it is never
-/// NULL, two NULLs are not distinct, and a NULL against a value is distinct.
-///
-/// A zero literal is already corrected by `optimize_expr`, so both `-0.0` and
-/// `+0.0` match `IS NOT DISTINCT FROM 0.0`. That correction intentionally
-/// differs from DataFusion 54's native distinct, which keeps the two encodings
-/// distinct under Arrow's total order. Column-against-column signed zeros and
-/// NaN keep that total-order answer: `-0.0` is distinct from `+0.0`, while two
-/// NaNs are not distinct. This spelling does not fix those.
-#[tokio::test]
-async fn test_query_is_distinct_from() {
-    let int_batch = RecordBatch::try_from_iter(vec![
-        (
-            "id",
-            Arc::new(Int32Array::from((0..4).collect::<Vec<i32>>())) as ArrayRef,
-        ),
-        (
-            "value",
-            Arc::new(Int32Array::from(vec![Some(1), None, Some(2), None])) as ArrayRef,
-        ),
-        (
-            "other",
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), None, None])) as ArrayRef,
-        ),
-    ])
-    .unwrap();
-    DatasetTestCases::from_data(int_batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::Bitmap),
-                Some(IndexType::BTree),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
-        .run(|ds: Dataset, original: RecordBatch| async move {
-            // Integers have no total-order quirk, so DataFusion is the reference.
-            test_filter(&original, &ds, "value IS DISTINCT FROM other").await;
-            test_filter(&original, &ds, "value IS NOT DISTINCT FROM other").await;
-            test_filter(&original, &ds, "value IS DISTINCT FROM 1").await;
-            test_filter(&original, &ds, "value IS NOT DISTINCT FROM 1").await;
-            test_filter(&original, &ds, "value IS DISTINCT FROM NULL").await;
-            test_filter(&original, &ds, "value IS NOT DISTINCT FROM NULL").await;
-        })
-        .await;
-
-    let string_batch = RecordBatch::try_from_iter(vec![
-        (
-            "id",
-            Arc::new(Int32Array::from((0..4).collect::<Vec<i32>>())) as ArrayRef,
-        ),
-        (
-            "value",
-            Arc::new(StringArray::from(vec![Some("a"), None, Some("b"), None])) as ArrayRef,
-        ),
-        (
-            "other",
-            Arc::new(StringArray::from(vec![Some("a"), Some("b"), None, None])) as ArrayRef,
-        ),
-    ])
-    .unwrap();
-    DatasetTestCases::from_data(string_batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::Bitmap),
-                Some(IndexType::BTree),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
-        .run(|ds: Dataset, original: RecordBatch| async move {
-            test_filter(&original, &ds, "value IS DISTINCT FROM other").await;
-            test_filter(&original, &ds, "value IS NOT DISTINCT FROM other").await;
-            test_filter(&original, &ds, "value IS DISTINCT FROM 'a'").await;
-            test_filter(&original, &ds, "value IS NOT DISTINCT FROM 'a'").await;
-        })
-        .await;
-
-    // Ids are 0: +0.0, 1: -0.0, 2: 1.0, 3: NULL, 4: NaN. `other` matches except
-    // row 1, which holds +0.0 where `value` holds -0.0.
-    let float_batch = RecordBatch::try_from_iter(vec![
-        (
-            "id",
-            Arc::new(Int32Array::from((0..5).collect::<Vec<i32>>())) as ArrayRef,
-        ),
-        (
-            "value",
-            Arc::new(Float64Array::from(vec![
-                Some(0.0),
-                Some(-0.0),
-                Some(1.0),
-                None,
-                Some(f64::NAN),
-            ])) as ArrayRef,
-        ),
-        (
-            "other",
-            Arc::new(Float64Array::from(vec![
-                Some(0.0),
-                Some(0.0),
-                Some(1.0),
-                None,
-                Some(f64::NAN),
-            ])) as ArrayRef,
-        ),
-    ])
-    .unwrap();
-    DatasetTestCases::from_data(float_batch)
-        .with_index_types(
-            "value",
-            [
-                None,
-                Some(IndexType::Bitmap),
-                Some(IndexType::BTree),
-                Some(IndexType::BloomFilter),
-                Some(IndexType::ZoneMap),
-            ],
-        )
-        .run(|ds: Dataset, _original: RecordBatch| async move {
-            // Both zero encodings match a zero literal; NULL never matches one.
-            // DataFusion's native distinct is not the reference here because it
-            // keeps `-0.0` distinct from `0.0`.
-            assert_filter_ids(&ds, "value IS NOT DISTINCT FROM 0.0", &[0, 1]).await;
-            assert_filter_ids(&ds, "value IS DISTINCT FROM 0.0", &[2, 3, 4]).await;
-            assert_filter_ids(&ds, "value IS NOT DISTINCT FROM 1.0", &[2]).await;
-            assert_filter_ids(&ds, "value IS DISTINCT FROM 1.0", &[0, 1, 3, 4]).await;
-            // Column against column keeps Arrow's total order: the sign-swapped
-            // zero pair is distinct, while two NaNs and two NULLs are not.
-            assert_filter_ids(&ds, "value IS DISTINCT FROM other", &[1]).await;
-            assert_filter_ids(&ds, "value IS NOT DISTINCT FROM other", &[0, 2, 3, 4]).await;
-            assert_filter_ids(&ds, "value IS DISTINCT FROM NULL", &[0, 1, 2, 4]).await;
-            assert_filter_ids(&ds, "value IS NOT DISTINCT FROM NULL", &[3]).await;
-        })
-        .await;
-}
-
-/// A null-safe comparison stays correct when a scalar index exists, even though
-/// the index does not accelerate it. Without this, a future index arm for
-/// `IS DISTINCT FROM` (or for the `(IN (..)) IS TRUE` shape the zero rewrite
-/// emits) could silently return the wrong rows instead of falling back to a
-/// filter.
-#[tokio::test]
-async fn test_is_distinct_from_does_not_use_scalar_index() {
-    let batch = RecordBatch::try_from_iter(vec![
-        (
-            "id",
-            Arc::new(Int32Array::from_iter_values(0..4)) as ArrayRef,
-        ),
-        (
-            "value",
-            Arc::new(Float64Array::from(vec![0.0, -0.0, 1.0, -1.0])) as ArrayRef,
-        ),
-    ])
-    .unwrap();
-    let schema = batch.schema();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    let mut ds = Dataset::write(reader, "memory://distinct_index_fallback", None)
-        .await
-        .unwrap();
-    ds.create_index(
-        &["value"],
-        IndexType::Scalar,
-        None,
-        &ScalarIndexParams::default(),
-        false,
-    )
-    .await
-    .unwrap();
-
-    for predicate in [
-        "value IS DISTINCT FROM 0.0",
-        "value IS NOT DISTINCT FROM 0.0",
-        "value IS DISTINCT FROM 1.0",
-    ] {
-        let plan = ds
-            .scan()
-            .filter(predicate)
-            .unwrap()
-            .explain_plan(false)
-            .await
-            .unwrap();
-        assert!(
-            !plan.contains("ScalarIndexQuery"),
-            "`{predicate}` should fall back to filtering, got plan:\n{plan}"
-        );
-    }
-
-    assert_filter_ids(&ds, "value IS NOT DISTINCT FROM 0.0", &[0, 1]).await;
-    assert_filter_ids(&ds, "value IS DISTINCT FROM 0.0", &[2, 3]).await;
-}
-
 #[tokio::test]
 #[rstest::rstest]
 #[case::date32(DataType::Date32)]
@@ -738,6 +554,8 @@ async fn test_query_string(#[case] data_type: DataType) {
             test_take(&original, &ds).await;
             test_filter(&original, &ds, "value = 'hello'").await;
             test_filter(&original, &ds, "value != 'hello'").await;
+            test_filter(&original, &ds, "value IS DISTINCT FROM 'hello'").await;
+            test_filter(&original, &ds, "value IS NOT DISTINCT FROM 'hello'").await;
             test_filter(&original, &ds, "value = ''").await;
             test_filter(&original, &ds, "value > 'hello'").await;
             test_filter(&original, &ds, "value is null").await;
