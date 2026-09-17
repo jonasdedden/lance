@@ -4,7 +4,7 @@
 //! Rewrites of comparisons against a floating point zero literal.
 
 use datafusion::error::Result as DFResult;
-use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList};
+use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList, expr::ScalarFunction};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
 use datafusion_common::tree_node::{Transformed, TreeNode};
@@ -26,12 +26,16 @@ use lance_core::Result;
 /// | `x != 0`                     | `x NOT IN (-0.0, 0.0)`       |
 /// | `x IN (0, ..)`               | the missing encoding is added |
 /// | `0 IN (a, b)`                | `a IN (-0.0, 0.0) OR b IN (-0.0, 0.0)` |
+/// | `array_has(l, 0)`            | `array_has(l, -0.0) OR array_has(l, 0.0)` |
 /// | `x IS NOT DISTINCT FROM 0`   | `x IS NOT NULL AND x IN (-0.0, 0.0)` |
 /// | `x IS DISTINCT FROM 0`       | `x IS NULL OR x NOT IN (-0.0, 0.0)` |
 ///
 /// Equality has to name both encodings because a scalar index keys on the bit
 /// pattern: the btree and bitmap indices order candidates by `total_cmp`, and the
-/// bloom filter hashes the value.
+/// bloom filter hashes the value. `array_has` needs the same disjunction because
+/// its kernel compares list elements with Arrow's total-order `eq`, and a scalar
+/// index never accelerates it into a different path: the rewritten filter still
+/// plans as a plain filter.
 ///
 /// Runs as the last step of [`crate::planner::Planner::optimize_expr`], after
 /// coercion has given the literal the column's type and the simplifier has
@@ -68,8 +72,8 @@ fn is_zero_sensitive(op: Operator) -> bool {
     )
 }
 
-/// Fold each zero-sensitive comparison's own operands and rewrite it, bottom-up,
-/// before anything above it has a chance to fold.
+/// Fold each zero-sensitive comparison's (or `array_has` probe's) own operands and
+/// rewrite it, bottom-up, before anything above it has a chance to fold.
 ///
 /// [`rewrite_signed_zero_comparisons`] alone cannot reach a comparison whose zero
 /// does not exist yet. `ExprSimplifier::simplify` folds an operand and everything
@@ -121,6 +125,17 @@ pub fn normalize_zero_comparisons(
                         .collect::<DFResult<Vec<_>>>()?,
                     negated: in_list.negated,
                 }),
+                Expr::ScalarFunction(func) if is_array_has(func.name()) => {
+                    // Fold the needle (and haystack) before rewriting, so a
+                    // computed zero such as `-1.0 * 0.0` presents as a zero
+                    // literal. Folding the whole `array_has` here would decide
+                    // it by Arrow's total order before the rewrite runs.
+                    let mut args = Vec::with_capacity(func.args.len());
+                    for arg in func.args {
+                        args.push(fold(arg)?);
+                    }
+                    Expr::ScalarFunction(ScalarFunction { func: func.func, args })
+                }
                 other => return Ok(Transformed::no(other)),
             };
             Ok(match rewrite_node(&folded) {
@@ -210,13 +225,17 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
         // over a bare column back into an OR chain of equalities, so a second
         // `optimize_expr` splits this rewrite's own output and re-runs it on each
         // half. Both halves then produce the same list, and dropping the repeat is
-        // what makes the rewrite survive that round trip.
+        // what makes the rewrite survive that round trip. The `array_has`
+        // rewrite below has the same shape: each half of its own disjunction
+        // expands again, so identical zero probes are dropped here too.
         Expr::BinaryExpr(BinaryExpr { op, .. }) if matches!(op, Operator::Or | Operator::And) => {
             let mut kept: Vec<&Expr> = Vec::new();
             flatten_chain(expr, *op, &mut kept);
             let mut deduped: Vec<&Expr> = Vec::with_capacity(kept.len());
             for term in kept.iter() {
-                if is_zero_pair_over_column(term) && deduped.contains(term) {
+                if (is_zero_pair_over_column(term) || is_array_has_zero_probe(term))
+                    && deduped.contains(term)
+                {
                     continue;
                 }
                 deduped.push(term);
@@ -353,8 +372,72 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
                 negated: *negated,
             }))
         }
+        Expr::ScalarFunction(func) if is_array_has(func.name()) => rewrite_array_has(func),
         _ => None,
     }
+}
+
+/// Whether `name` is the list-membership function, under any of DataFusion's
+/// aliases. Matching aliases here keeps `list_has`, `array_contains`, and
+/// `list_contains` on the same IEEE semantics as `array_has`: they resolve to
+/// the same kernel, so leaving one spelling sign-sensitive would be a dialect
+/// accident rather than a rule.
+fn is_array_has(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "array_has" | "list_has" | "array_contains" | "list_contains"
+    )
+}
+
+/// True for a single `array_has` probe against a floating point zero literal,
+/// either encoding. Only these terms are deduplicated, so an expression the
+/// caller wrote twice for another needle is left alone.
+fn is_array_has_zero_probe(expr: &Expr) -> bool {
+    let Expr::ScalarFunction(func) = expr else {
+        return false;
+    };
+    if !is_array_has(func.name()) || func.args.len() != 2 {
+        return false;
+    }
+    matches!(&func.args[1], Expr::Literal(value, _) if zero_encodings(value).is_some())
+}
+
+/// Rewrite `array_has(haystack, zero)` into the disjunction Arrow's total-order
+/// `eq` kernel answers the way IEEE 754 defines it.
+///
+/// Returns `None` for anything but a floating point zero needle, including
+/// NULL, NaN, integer zero, and non-literal needles. An integer needle against
+/// a float list is still rewritten: coercion has already given it the column's
+/// floating type by the time this runs, so it presents as a floating zero. An
+/// integer list keeps integer semantics because its needle never presents as a
+/// floating zero. A column needle stays sign-sensitive; that is the
+/// column-to-column case (issue #9316, first part), not this literal rewrite.
+fn rewrite_array_has(func: &ScalarFunction) -> Option<Expr> {
+    if func.args.len() != 2 {
+        return None;
+    }
+    let haystack = &func.args[0];
+    let Expr::Literal(value, metadata) = &func.args[1] else {
+        return None;
+    };
+    let (negative, positive) = zero_encodings(value)?;
+    // Negative first, so both encodings map to the same canonical disjunction
+    // and a second pass deduplicates rather than growing.
+    let matches_negative = Expr::ScalarFunction(ScalarFunction {
+        func: func.func.clone(),
+        args: vec![
+            haystack.clone(),
+            Expr::Literal(negative, metadata.clone()),
+        ],
+    });
+    let matches_positive = Expr::ScalarFunction(ScalarFunction {
+        func: func.func.clone(),
+        args: vec![
+            haystack.clone(),
+            Expr::Literal(positive, metadata.clone()),
+        ],
+    });
+    Some(matches_negative.or(matches_positive))
 }
 
 /// Add the missing encoding next to every floating point zero in an `IN` list.
@@ -605,6 +688,195 @@ mod tests {
                 matches_any
             }
         );
+    }
+
+    fn list_schema(inner: arrow_schema::DataType) -> std::sync::Arc<arrow_schema::Schema> {
+        std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "l",
+            arrow_schema::DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                "item", inner, true,
+            ))),
+            true,
+        )]))
+    }
+
+    fn unalias(mut expr: &Expr) -> &Expr {
+        while let Expr::Alias(alias) = expr {
+            expr = &alias.expr;
+        }
+        expr
+    }
+
+    fn is_array_has_or_of_zero_pair(expr: &Expr) -> bool {
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = unalias(expr) else {
+            return false;
+        };
+        if *op != Operator::Or {
+            return false;
+        }
+        is_array_has_zero_probe(left) && is_array_has_zero_probe(right) && left != right
+    }
+
+    #[test]
+    fn array_has_zero_needle_covers_both_encodings() {
+        let planner = crate::planner::Planner::new(list_schema(arrow_schema::DataType::Float64));
+        let expected = planner
+            .parse_filter("array_has(l, -0.0) OR array_has(l, 0.0)")
+            .unwrap();
+        // Both encodings map to the same canonical disjunction, negative first.
+        assert_eq!(
+            rewrite(planner.parse_filter("array_has(l, 0.0)").unwrap()),
+            expected
+        );
+        assert_eq!(
+            rewrite(planner.parse_filter("array_has(l, -0.0)").unwrap()),
+            expected
+        );
+    }
+
+    #[test]
+    fn array_has_leaves_non_zero_needles_alone() {
+        let planner = crate::planner::Planner::new(list_schema(arrow_schema::DataType::Float64));
+        // At the post-simplify layer an integer `0` is still an integer zero,
+        // so there is nothing to widen. After coercion against a float list it
+        // presents as a floating zero and is rewritten; that is covered by the
+        // optimizer test below.
+        for filter in ["array_has(l, 1.0)", "array_has(l, 0)", "array_has(l, NULL)"] {
+            let parsed = planner.parse_filter(filter).unwrap();
+            assert_eq!(rewrite(parsed.clone()), parsed, "filter: {filter}");
+        }
+        // NaN is out of scope, like everywhere else in this module.
+        let parsed = planner
+            .parse_filter("array_has(l, CAST('NaN' AS DOUBLE))")
+            .unwrap();
+        assert_eq!(rewrite(parsed.clone()), parsed);
+    }
+
+    #[test]
+    fn array_has_leaves_column_needles_alone() {
+        // A column needle is the column-to-column case (issue #9316, first
+        // part), not this literal rewrite.
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                "l",
+                arrow_schema::DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Float64,
+                    true,
+                ))),
+                true,
+            ),
+            arrow_schema::Field::new("m", arrow_schema::DataType::Float64, true),
+        ]));
+        let planner = crate::planner::Planner::new(schema);
+        let parsed = planner.parse_filter("array_has(l, m)").unwrap();
+        assert_eq!(rewrite(parsed.clone()), parsed);
+    }
+
+    #[test]
+    fn array_has_integer_list_keeps_integer_semantics() {
+        let planner = crate::planner::Planner::new(list_schema(arrow_schema::DataType::Int64));
+        let optimized = planner
+            .optimize_expr(planner.parse_filter("array_has(l, 0)").unwrap())
+            .unwrap();
+        assert!(
+            !is_array_has_or_of_zero_pair(&optimized),
+            "integer needle must stay a single probe: {optimized:?}"
+        );
+    }
+
+    #[test]
+    fn array_has_float_lists_cover_both_encodings_after_coercion() {
+        for inner in [
+            arrow_schema::DataType::Float64,
+            arrow_schema::DataType::Float32,
+        ] {
+            let planner = crate::planner::Planner::new(list_schema(inner.clone()));
+            for filter in ["array_has(l, 0.0)", "array_has(l, -0.0)", "array_has(l, 0)"] {
+                let optimized = planner.optimize_expr(planner.parse_filter(filter).unwrap()).unwrap();
+                assert!(
+                    is_array_has_or_of_zero_pair(&optimized),
+                    "filter {filter} on {inner:?} must be a zero-pair OR, got: {optimized:?}"
+                );
+                // A second optimization is a fixed point.
+                assert_eq!(
+                    planner.optimize_expr(optimized.clone()).unwrap(),
+                    optimized,
+                    "filter: {filter} on {inner:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn array_has_rewrites_nested_and_computed_haystacks() {
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                "l",
+                arrow_schema::DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Float64,
+                    true,
+                ))),
+                true,
+            ),
+            arrow_schema::Field::new(
+                "s",
+                arrow_schema::DataType::Struct(arrow_schema::Fields::from(vec![
+                    arrow_schema::Field::new(
+                        "x",
+                        arrow_schema::DataType::List(std::sync::Arc::new(
+                            arrow_schema::Field::new(
+                                "item",
+                                arrow_schema::DataType::Float64,
+                                true,
+                            ),
+                        )),
+                        true,
+                    ),
+                ])),
+                true,
+            ),
+        ]));
+        let planner = crate::planner::Planner::new(schema);
+        for filter in [
+            "array_has(s.x, 0.0)",
+            "array_has(array_append(l, 1.0), 0.0)",
+        ] {
+            let optimized = planner.optimize_expr(planner.parse_filter(filter).unwrap()).unwrap();
+            assert!(
+                is_array_has_or_of_zero_pair(&optimized),
+                "filter {filter} must be a zero-pair OR, got: {optimized:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn array_has_rewrites_computed_zero_needles() {
+        let planner = crate::planner::Planner::new(list_schema(arrow_schema::DataType::Float64));
+        let canonical = planner
+            .optimize_expr(planner.parse_filter("array_has(l, 0.0)").unwrap())
+            .unwrap();
+        for filter in ["array_has(l, -1.0 * 0.0)", "array_has(l, 1.0 - 1.0)"] {
+            let optimized = planner.optimize_expr(planner.parse_filter(filter).unwrap()).unwrap();
+            assert_eq!(optimized, canonical, "filter: {filter}");
+        }
+    }
+
+    #[test]
+    fn array_has_aliases_rewrite_like_array_has() {
+        let planner = crate::planner::Planner::new(list_schema(arrow_schema::DataType::Float64));
+        for filter in [
+            "list_has(l, 0.0)",
+            "array_contains(l, 0.0)",
+            "list_contains(l, 0.0)",
+        ] {
+            let optimized = planner.optimize_expr(planner.parse_filter(filter).unwrap()).unwrap();
+            assert!(
+                is_array_has_or_of_zero_pair(&optimized),
+                "filter {filter} must be a zero-pair OR, got: {optimized:?}"
+            );
+        }
     }
 
     #[test]
