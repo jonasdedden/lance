@@ -27,7 +27,7 @@ use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
 use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
 use arrow_array::{
-    ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
+    ArrayRef, Float32Array, Int32Array, Int64Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
     types::{Float32Type, Int32Type, Int64Type},
 };
@@ -581,6 +581,162 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
             sorted_ids(&indexed),
             sorted_ids(&baseline),
             "indexed result differs for {predicate}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_numeric_coercion_uses_scalar_index() {
+    // Issues #9317 (integer column versus fractional float) and #9318
+    // (exactly convertible doubles against `Float32`): rewritten comparisons
+    // must stay on the column so BTREE and BITMAP indices apply, and indexed
+    // results must match the unindexed scan.
+    for index_type in [IndexType::BTree, IndexType::Bitmap] {
+        let index_name = match index_type {
+            IndexType::BTree => "btree",
+            IndexType::Bitmap => "bitmap",
+            _ => unreachable!(),
+        };
+        let test_uri = TempStrDir::default();
+        let num_rows = 1_000u64;
+        // Null every 10th row so null handling (`NOT`, `!=`) is exercised.
+        let i_values: Vec<Option<i64>> = (0..num_rows)
+            .map(|id| if id % 10 == 0 { None } else { Some(id as i64) })
+            .collect();
+        let x_values: Vec<Option<f32>> =
+            i_values.iter().map(|v| v.map(|v| v as f32 / 2.0)).collect();
+        let ids = UInt64Array::from_iter_values(0..num_rows);
+        let batch = RecordBatch::try_from_iter(vec![
+            ("i", Arc::new(Int64Array::from(i_values)) as ArrayRef),
+            ("x", Arc::new(Float32Array::from(x_values)) as ArrayRef),
+            ("id", Arc::new(ids) as ArrayRef),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+        for col in ["i", "x"] {
+            dataset
+                .create_index(
+                    &[col],
+                    index_type,
+                    Some(format!("{col}_{index_name}")),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Selective predicates must plan to a `ScalarIndexQuery` and return
+        // the same rows with the index on and off. `i > 1.5` previously
+        // errored; `CAST(i AS double) > 1.5` and the typed doubles previously
+        // cast the column and skipped the index.
+        for predicate in [
+            "i > 1",
+            "i > 1.5",
+            "i >= 1.5",
+            "i < 1.5",
+            "i = 2.0",
+            "CAST(i AS double) > 1.5",
+            "x > 0.5",
+            "x > CAST(0.5 AS double)",
+            "x > CAST(0.5 AS float)",
+            "i BETWEEN 1.5 AND 10.5",
+            "i IN (1.5, 2.0)",
+        ] {
+            let mut indexed_scan = dataset.scan();
+            indexed_scan
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let plan = indexed_scan.explain_plan(false).await.unwrap();
+            assert!(
+                plan.contains("ScalarIndexQuery"),
+                "{index_name:?} index not used for {predicate}:\n{plan}"
+            );
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+            let mut baseline_scan = dataset.scan();
+            baseline_scan.use_scalar_index(false);
+            baseline_scan
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let baseline = baseline_scan.try_into_batch().await.unwrap();
+
+            let sorted_ids = |batch: &RecordBatch| {
+                let mut ids = batch
+                    .column(0)
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec();
+                ids.sort_unstable();
+                ids
+            };
+            assert_eq!(
+                sorted_ids(&indexed),
+                sorted_ids(&baseline),
+                "{index_name:?} indexed result differs for {predicate}"
+            );
+        }
+
+        // Always-true, always-false and empty predicates are correctness-only:
+        // a full scan is the right plan when almost every row (or no row)
+        // matches, so no `ScalarIndexQuery` is required. `NOT (i = 1.5)` also
+        // pins the null handling: null rows must stay filtered, not come back.
+        for predicate in ["i != 1.5", "NOT (i = 1.5)", "x < CAST('-inf' AS double)"] {
+            let mut indexed_scan = dataset.scan();
+            indexed_scan
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+
+            let mut baseline_scan = dataset.scan();
+            baseline_scan.use_scalar_index(false);
+            baseline_scan
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let baseline = baseline_scan.try_into_batch().await.unwrap();
+
+            let sorted_ids = |batch: &RecordBatch| {
+                let mut ids = batch
+                    .column(0)
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec();
+                ids.sort_unstable();
+                ids
+            };
+            assert_eq!(
+                sorted_ids(&indexed),
+                sorted_ids(&baseline),
+                "{index_name:?} result differs for {predicate}"
+            );
+        }
+
+        // Exactly convertible doubles must plan as `Float32`, not as a column
+        // cast to `Float64`.
+        let mut scan = dataset.scan();
+        scan.filter("x > CAST(0.5 AS double)")
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("Float32(0.5)"),
+            "expected Float32 literal, got:\n{plan}"
+        );
+        assert!(
+            !plan.contains("CAST(x AS Float64)"),
+            "column must not be cast, got:\n{plan}"
         );
     }
 }
