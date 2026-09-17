@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Rewrites of comparisons against a floating point zero literal.
+//! Rewrites of floating point zero comparisons.
+//!
+//! The literal half rewrites comparisons against a zero literal. The
+//! column half rewrites comparisons between two non-literal float values,
+//! which have no literal to retarget and still compare by encoding.
 
+use arrow_schema::DataType as ArrowDataType;
 use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::ExprSchemable;
 use datafusion::logical_expr::{BinaryExpr, Operator, expr::Between, expr::InList};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue::{self, Float16, Float32, Float64};
+use datafusion_common::DFSchema;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use half::f16;
 use lance_core::Result;
@@ -42,13 +49,38 @@ use lance_core::Result;
 /// NaN is out of scope. Arrow sorts it above every other value, so `x >= -0.0`
 /// admits NaN where IEEE would not, and that holds for every comparison rather
 /// than only the ones against zero.
-pub fn rewrite_signed_zero_comparisons(expr: Expr) -> Result<Expr> {
+///
+/// Comparisons between two non-literal float values have no literal to retarget,
+/// so they name both zero encodings on each side:
+///
+/// | written              | evaluated                                                   |
+/// |----------------------|---------------------------------------------------------------|
+/// | `a = b`              | `(a = b) OR (a IN (-0, 0) AND b IN (-0, 0))`                |
+/// | `a <= b`, `a >= b`   | same `OR` shape as `=`                                     |
+/// | `a != b`             | `(a != b) AND NOT (a IN (-0, 0) AND b IN (-0, 0))`          |
+/// | `a < b`, `a > b`     | same `AND NOT` shape as `!=`                               |
+/// | `a IS NOT DISTINCT FROM b` | `(a IS NOT DISTINCT FROM b) OR ((both zero) IS TRUE)` |
+/// | `a IS DISTINCT FROM b`     | `(a IS DISTINCT FROM b) AND ((both zero) IS NOT TRUE)` |
+///
+/// Each side names its own float width, so a `Float32` operand lists `Float32`
+/// zeros and a `Float64` operand lists `Float64` zeros. Non-float comparisons
+/// are left alone, and any comparison with a literal side is left to the
+/// literal rewrite above. `NULL` rows stay `NULL` for the six ordered/equality
+/// operators because `(NULL IN ..) ` is `NULL` and `NULL OR/AND ...` preserves
+/// it; the distinctness pair stays decided through `IS [NOT] TRUE`.
+/// `BETWEEN` needs no arm here: the simplifier expands non-constant bounds into
+/// `>=`/`<=` before this runs, and the constant-`BETWEEN` arm above owns the
+/// fully constant shape.
+pub fn rewrite_signed_zero_comparisons(expr: Expr, df_schema: &DFSchema) -> Result<Expr> {
     Ok(expr
         .transform_up(|node| {
-            Ok(match rewrite_node(&node) {
-                Some(rewritten) => Transformed::yes(rewritten),
-                None => Transformed::no(node),
-            })
+            if let Some(rewritten) = rewrite_node(&node) {
+                return Ok(Transformed::yes(rewritten));
+            }
+            if let Some(rewritten) = rewrite_column_node(&node, df_schema) {
+                return Ok(Transformed::yes(rewritten));
+            }
+            Ok(Transformed::no(node))
         })?
         .data)
 }
@@ -216,7 +248,9 @@ fn rewrite_node(expr: &Expr) -> Option<Expr> {
             flatten_chain(expr, *op, &mut kept);
             let mut deduped: Vec<&Expr> = Vec::with_capacity(kept.len());
             for term in kept.iter() {
-                if is_zero_pair_over_column(term) && deduped.contains(term) {
+                if (is_zero_pair_over_column(term) || is_column_rewrite_term(term))
+                    && deduped.contains(term)
+                {
                     continue;
                 }
                 deduped.push(term);
@@ -394,15 +428,172 @@ fn widen_zero_list(list: &[Expr]) -> Option<Vec<Expr>> {
     Some(widened)
 }
 
+/// Both zero encodings for a float width, negative first.
+///
+/// Unlike [`zero_encodings`], which keys off a literal value, this keys off the
+/// operand's data type so a non-literal float expression can name its own zeros.
+fn float_zero_pair_for_type(data_type: &ArrowDataType) -> Option<(ScalarValue, ScalarValue)> {
+    match data_type {
+        ArrowDataType::Float16 => Some((Float16(Some(f16::NEG_ZERO)), Float16(Some(f16::ZERO)))),
+        ArrowDataType::Float32 => Some((Float32(Some(-0.0)), Float32(Some(0.0)))),
+        ArrowDataType::Float64 => Some((Float64(Some(-0.0)), Float64(Some(0.0)))),
+        _ => None,
+    }
+}
+
+/// The float width of `expr`, or `None` when it is not a float or its type
+/// cannot be inferred from `df_schema`.
+///
+/// A `None` here means "leave the comparison alone", never an error: unknown
+/// types keep the pre-existing total-order behavior rather than failing the
+/// whole filter.
+fn float_type_of(expr: &Expr, df_schema: &DFSchema) -> Option<ArrowDataType> {
+    let data_type = expr.get_type(df_schema).ok()?;
+    match data_type {
+        ArrowDataType::Float16 | ArrowDataType::Float32 | ArrowDataType::Float64 => Some(data_type),
+        _ => None,
+    }
+}
+
+/// True when `expr` is a non-negated `IN` list holding exactly both encodings of
+/// a float zero, over any operand (column, nested field, or computed value).
+fn is_zero_in_list(expr: &Expr) -> bool {
+    let Expr::InList(InList {
+        list,
+        negated: false,
+        ..
+    }) = expr
+    else {
+        return false;
+    };
+    let [Expr::Literal(first, _), ..] = list.as_slice() else {
+        return false;
+    };
+    zero_encodings(first)
+        .is_some_and(|(negative, positive)| list_is_pair(list, &negative, &positive))
+}
+
+/// True when `expr` is the `both zero` conjunction this rewrite emits: one zero
+/// `IN` list per side, joined by `AND`.
+fn is_both_zero_conjunction(expr: &Expr) -> bool {
+    let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: Operator::And,
+        right,
+    }) = expr
+    else {
+        return false;
+    };
+    is_zero_in_list(left) && is_zero_in_list(right)
+}
+
+/// True when `expr` is `NOT (both zero)`, the guard the `!=`/`<`/`>` arm emits.
+fn is_not_both_zero(expr: &Expr) -> bool {
+    let Expr::Not(inner) = expr else {
+        return false;
+    };
+    is_both_zero_conjunction(inner)
+}
+
+/// True when `expr` is `(both zero) IS [NOT] TRUE`, the decided guard the
+/// distinctness arms emit.
+fn is_both_zero_decided(expr: &Expr) -> bool {
+    match expr {
+        Expr::IsTrue(inner) | Expr::IsNotTrue(inner) => is_both_zero_conjunction(inner),
+        _ => false,
+    }
+}
+
+/// True for any term the column-column rewrite emits. Only these terms are
+/// deduplicated in `AND`/`OR` chains, so an expression the caller wrote twice
+/// is left alone.
+fn is_column_rewrite_term(expr: &Expr) -> bool {
+    is_both_zero_conjunction(expr) || is_not_both_zero(expr) || is_both_zero_decided(expr)
+}
+
+/// `operand IN (-0, 0)` in the operand's own float width.
+fn zero_in_list_for(operand: Expr, data_type: &ArrowDataType) -> Option<Expr> {
+    let (negative, positive) = float_zero_pair_for_type(data_type)?;
+    Some(Expr::InList(InList {
+        expr: Box::new(operand),
+        list: vec![Expr::Literal(negative, None), Expr::Literal(positive, None)],
+        negated: false,
+    }))
+}
+
+/// Rewrite a comparison between two non-literal float values.
+///
+/// Returns `None` when `expr` is not such a comparison: wrong operator, a
+/// literal on either side (owned by [`rewrite_node`]), or a side whose type is
+/// not `Float16`/`Float32`/`Float64`. The `OR`/`AND NOT` shapes preserve `NULL`
+/// for the six value operators; the distinctness pair uses `IS [NOT] TRUE` so a
+/// `NULL` operand keeps its decided true/false answer.
+fn rewrite_column_node(expr: &Expr, df_schema: &DFSchema) -> Option<Expr> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return None;
+    };
+    if !is_zero_sensitive(*op) {
+        return None;
+    }
+    // The literal rewrite owns any comparison with a literal side, including a
+    // non-zero literal where no zero correction applies.
+    if matches!(left.as_ref(), Expr::Literal(..)) || matches!(right.as_ref(), Expr::Literal(..)) {
+        return None;
+    }
+    let left_type = float_type_of(left, df_schema)?;
+    let right_type = float_type_of(right, df_schema)?;
+    let left_in = zero_in_list_for((**left).clone(), &left_type)?;
+    let right_in = zero_in_list_for((**right).clone(), &right_type)?;
+    let both_zero = left_in.and(right_in);
+    let original = expr.clone();
+    match op {
+        Operator::Eq | Operator::LtEq | Operator::GtEq => Some(original.or(both_zero)),
+        Operator::NotEq | Operator::Lt | Operator::Gt => {
+            Some(original.and(Expr::Not(Box::new(both_zero))))
+        }
+        Operator::IsDistinctFrom => Some(original.and(both_zero.is_not_true())),
+        Operator::IsNotDistinctFrom => Some(original.or(both_zero.is_true())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use arrow_schema::{Field, Schema as ArrowSchema};
     use datafusion::prelude::{col, lit};
+
     use rstest::rstest;
 
     use super::*;
 
+    fn empty_schema() -> DFSchema {
+        DFSchema::empty()
+    }
+
+    fn float_schema() -> DFSchema {
+        let schema = ArrowSchema::new(vec![
+            Field::new("a", ArrowDataType::Float64, true),
+            Field::new("b", ArrowDataType::Float64, true),
+            Field::new("i", ArrowDataType::Int64, true),
+            Field::new("s", ArrowDataType::Utf8, true),
+        ]);
+        DFSchema::try_from(schema).unwrap()
+    }
+
+    fn float32_schema() -> DFSchema {
+        let schema = ArrowSchema::new(vec![
+            Field::new("a", ArrowDataType::Float32, true),
+            Field::new("b", ArrowDataType::Float32, true),
+        ]);
+        DFSchema::try_from(schema).unwrap()
+    }
+
     fn rewrite(expr: Expr) -> Expr {
-        rewrite_signed_zero_comparisons(expr).unwrap()
+        rewrite_signed_zero_comparisons(expr, &empty_schema()).unwrap()
+    }
+
+    fn rewrite_with_schema(expr: Expr, schema: &DFSchema) -> Expr {
+        rewrite_signed_zero_comparisons(expr, schema).unwrap()
     }
 
     fn compare(left: Expr, op: Operator, right: Expr) -> Expr {
@@ -605,6 +796,172 @@ mod tests {
                 matches_any
             }
         );
+    }
+
+    #[rstest]
+    #[case::eq(Operator::Eq)]
+    #[case::lt_eq(Operator::LtEq)]
+    #[case::gt_eq(Operator::GtEq)]
+    fn column_equality_adds_both_zero_disjunct(#[case] op: Operator) {
+        let schema = float_schema();
+        let original = compare(col("a"), op, col("b"));
+        let both_zero = Expr::InList(InList {
+            expr: Box::new(col("a")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        })
+        .and(Expr::InList(InList {
+            expr: Box::new(col("b")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        }));
+        assert_eq!(
+            rewrite_with_schema(original.clone(), &schema),
+            original.or(both_zero)
+        );
+    }
+
+    #[rstest]
+    #[case::not_eq(Operator::NotEq)]
+    #[case::lt(Operator::Lt)]
+    #[case::gt(Operator::Gt)]
+    fn column_inequality_adds_both_zero_conjunct(#[case] op: Operator) {
+        let schema = float_schema();
+        let original = compare(col("a"), op, col("b"));
+        let both_zero = Expr::InList(InList {
+            expr: Box::new(col("a")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        })
+        .and(Expr::InList(InList {
+            expr: Box::new(col("b")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        }));
+        assert_eq!(
+            rewrite_with_schema(original.clone(), &schema),
+            original.and(Expr::Not(Box::new(both_zero)))
+        );
+    }
+
+    #[test]
+    fn column_comparison_keeps_each_side_float_width() {
+        let schema = float32_schema();
+        let original = compare(col("a"), Operator::Eq, col("b"));
+        let both_zero = Expr::InList(InList {
+            expr: Box::new(col("a")),
+            list: vec![
+                Expr::Literal(Float32(Some(-0.0)), None),
+                Expr::Literal(Float32(Some(0.0)), None),
+            ],
+            negated: false,
+        })
+        .and(Expr::InList(InList {
+            expr: Box::new(col("b")),
+            list: vec![
+                Expr::Literal(Float32(Some(-0.0)), None),
+                Expr::Literal(Float32(Some(0.0)), None),
+            ],
+            negated: false,
+        }));
+        assert_eq!(
+            rewrite_with_schema(original.clone(), &schema),
+            original.or(both_zero)
+        );
+    }
+
+    #[test]
+    fn column_comparison_rewrites_computed_float_operands() {
+        let schema = float_schema();
+        let left = col("a") * lit(2.0);
+        let original = compare(left.clone(), Operator::Eq, col("b"));
+        let rewritten = rewrite_with_schema(original, &schema);
+        // The computed side is named twice: once in the passthrough comparison
+        // and once in its zero `IN` list. That double evaluation is what keeps
+        // the shape index-free but correct; a shared subexpression would need a
+        // new planner-level CSE rather than a local rewrite.
+        let left_in = Expr::InList(InList {
+            expr: Box::new(left),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        });
+        let right_in = Expr::InList(InList {
+            expr: Box::new(col("b")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        });
+        let expected =
+            compare(col("a") * lit(2.0), Operator::Eq, col("b")).or(left_in.and(right_in));
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn column_rewrite_leaves_non_float_pairs_alone() {
+        let schema = float_schema();
+        for expr in [
+            col("i").eq(col("i")),
+            col("s").eq(col("s")),
+            col("a").eq(col("i")),
+            col("a").eq(lit(1.0)),
+        ] {
+            assert_eq!(
+                rewrite_with_schema(expr.clone(), &schema),
+                expr,
+                "should leave {expr} alone"
+            );
+        }
+    }
+
+    #[test]
+    fn column_arm_defers_zero_literals_to_the_literal_arm() {
+        // `a = 0.0` must become the literal arm's `IN` list, not the column
+        // arm's `OR`.
+        let schema = float_schema();
+        assert_eq!(
+            rewrite_with_schema(col("a").eq(lit(0.0)), &schema),
+            Expr::InList(InList {
+                expr: Box::new(col("a")),
+                list: vec![lit(-0.0), lit(0.0)],
+                negated: false,
+            })
+        );
+    }
+
+    #[rstest]
+    #[case::is_distinct_from(Operator::IsDistinctFrom)]
+    #[case::is_not_distinct_from(Operator::IsNotDistinctFrom)]
+    fn column_distinctness_stays_decided(#[case] op: Operator) {
+        let schema = float_schema();
+        let original = compare(col("a"), op, col("b"));
+        let both_zero = Expr::InList(InList {
+            expr: Box::new(col("a")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        })
+        .and(Expr::InList(InList {
+            expr: Box::new(col("b")),
+            list: vec![lit(-0.0), lit(0.0)],
+            negated: false,
+        }));
+        let expected = if op == Operator::IsDistinctFrom {
+            original.clone().and(both_zero.is_not_true())
+        } else {
+            original.clone().or(both_zero.is_true())
+        };
+        assert_eq!(rewrite_with_schema(original, &schema), expected);
+    }
+
+    #[rstest]
+    #[case::eq(Operator::Eq)]
+    #[case::not_eq(Operator::NotEq)]
+    #[case::lt(Operator::Lt)]
+    #[case::lt_eq(Operator::LtEq)]
+    #[case::gt(Operator::Gt)]
+    #[case::gt_eq(Operator::GtEq)]
+    fn rewriting_a_column_comparison_twice_changes_nothing(#[case] op: Operator) {
+        let schema = float_schema();
+        let once = rewrite_with_schema(compare(col("a"), op, col("b")), &schema);
+        assert_eq!(rewrite_with_schema(once.clone(), &schema), once);
     }
 
     #[test]

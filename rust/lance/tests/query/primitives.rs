@@ -422,6 +422,214 @@ async fn test_float_zero_predicate_uses_scalar_index() {
     assert_filter_ids(&ds, "value >= 0.0", &[0, 1, 2, 4, 5, 6]).await;
 }
 
+/// Column-versus-column signed-zero comparisons treat `-0.0` and `+0.0` as one
+/// number, matching IEEE 754 and SQL.
+///
+/// Arrow's total-order kernels rank `-0.0` below `+0.0` and compare equality by
+/// bit pattern, so `a = b` missed opposite-zero pairs and `a < b` admitted
+/// `-0.0 < +0.0`. The planner rewrites each float-float comparison to name both
+/// encodings on each side (`OR (a IN (-0, 0) AND b IN (-0, 0))` for `=`/`<=`/`>=`,
+/// `AND NOT (...)` for `!=`/`<`/`>`), with `IS [NOT] TRUE` for the distinctness
+/// pair so `NULL` rows stay decided. Each side lists its own float width.
+///
+/// `array_has` with a zero is out of scope here (sibling fix for #9316); NaN
+/// ordering between columns is #9315 and is pinned, not changed, below.
+#[tokio::test]
+#[rstest::rstest]
+#[case::float16(DataType::Float16)]
+#[case::float32(DataType::Float32)]
+#[case::float64(DataType::Float64)]
+async fn test_query_float_column_zero_comparison(#[case] data_type: DataType) {
+    use arrow_array::{Float16Array, StructArray};
+
+    // ids: 0:-0/+0 1:+0/-0 2:-0/-0 3:+0/+0 4:1/1 5:-1/-1 6:+inf/+inf
+    //      7:-inf/-inf 8:null/null 9:null/+0 10:+0/null 11:1/-1
+    let (a_array, b_array): (ArrayRef, ArrayRef) = match data_type {
+        DataType::Float16 => {
+            let a = Float16Array::from(vec![
+                Some(f16::NEG_ZERO),
+                Some(f16::ZERO),
+                Some(f16::NEG_ZERO),
+                Some(f16::ZERO),
+                Some(f16::ONE),
+                Some(f16::NEG_ONE),
+                Some(f16::INFINITY),
+                Some(f16::NEG_INFINITY),
+                None,
+                None,
+                Some(f16::ZERO),
+                Some(f16::ONE),
+            ]);
+            let b = Float16Array::from(vec![
+                Some(f16::ZERO),
+                Some(f16::NEG_ZERO),
+                Some(f16::NEG_ZERO),
+                Some(f16::ZERO),
+                Some(f16::ONE),
+                Some(f16::NEG_ONE),
+                Some(f16::INFINITY),
+                Some(f16::NEG_INFINITY),
+                None,
+                Some(f16::ZERO),
+                None,
+                Some(f16::NEG_ONE),
+            ]);
+            (Arc::new(a), Arc::new(b))
+        }
+        DataType::Float32 => {
+            let a = Float32Array::from(vec![
+                Some(-0.0_f32),
+                Some(0.0_f32),
+                Some(-0.0_f32),
+                Some(0.0_f32),
+                Some(1.0_f32),
+                Some(-1.0_f32),
+                Some(f32::INFINITY),
+                Some(f32::NEG_INFINITY),
+                None,
+                None,
+                Some(0.0_f32),
+                Some(1.0_f32),
+            ]);
+            let b = Float32Array::from(vec![
+                Some(0.0_f32),
+                Some(-0.0_f32),
+                Some(-0.0_f32),
+                Some(0.0_f32),
+                Some(1.0_f32),
+                Some(-1.0_f32),
+                Some(f32::INFINITY),
+                Some(f32::NEG_INFINITY),
+                None,
+                Some(0.0_f32),
+                None,
+                Some(-1.0_f32),
+            ]);
+            (Arc::new(a), Arc::new(b))
+        }
+        _ => {
+            let a = Float64Array::from(vec![
+                Some(-0.0_f64),
+                Some(0.0_f64),
+                Some(-0.0_f64),
+                Some(0.0_f64),
+                Some(1.0_f64),
+                Some(-1.0_f64),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None,
+                None,
+                Some(0.0_f64),
+                Some(1.0_f64),
+            ]);
+            let b = Float64Array::from(vec![
+                Some(0.0_f64),
+                Some(-0.0_f64),
+                Some(-0.0_f64),
+                Some(0.0_f64),
+                Some(1.0_f64),
+                Some(-1.0_f64),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                None,
+                Some(0.0_f64),
+                None,
+                Some(-1.0_f64),
+            ]);
+            (Arc::new(a), Arc::new(b))
+        }
+    };
+
+    let id_array = Arc::new(Int32Array::from((0..12).collect::<Vec<i32>>())) as ArrayRef;
+    // Nested mirror of a/b so struct field comparisons exercise the same rule
+    // through `get_field` rather than a bare column.
+    let struct_array = Arc::new(StructArray::new(
+        vec![
+            Arc::new(arrow_schema::Field::new(
+                "x",
+                a_array.data_type().clone(),
+                true,
+            )),
+            Arc::new(arrow_schema::Field::new(
+                "y",
+                b_array.data_type().clone(),
+                true,
+            )),
+        ]
+        .into(),
+        vec![a_array.clone(), b_array.clone()],
+        None,
+    )) as ArrayRef;
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", id_array),
+        ("a", a_array),
+        ("b", b_array),
+        ("s", struct_array),
+    ])
+    .unwrap();
+
+    // Bloom filters hash by bit pattern today; column-column equality cannot be
+    // answered from a single-column index anyway, so only BTree/Bitmap (which
+    // must fall back to filtering without changing rows) plus the unindexed
+    // path are exercised for row equality here.
+    let mut index_types = vec![None, Some(IndexType::BTree), Some(IndexType::Bitmap)];
+    if data_type != DataType::Float16 {
+        // ZoneMap is included where the type supports it; it also falls back
+        // for column-column predicates.
+        index_types.push(Some(IndexType::ZoneMap));
+    }
+
+    DatasetTestCases::from_data(batch)
+        .with_index_types("a", index_types)
+        .run(|ds: Dataset, _original: RecordBatch| async move {
+            // Column-column predicates cannot be answered from a single-column
+            // scalar index; they must fall back to filtering without changing
+            // rows. Pin the fallback so a future index change is explicit.
+            let plan = ds
+                .scan()
+                .filter("a = b")
+                .unwrap()
+                .explain_plan(false)
+                .await
+                .unwrap();
+            assert!(
+                !plan.contains("ScalarIndexQuery"),
+                "`a = b` should not claim a scalar index query, got plan:\n{plan}"
+            );
+            // Equality treats every zero pair as equal; only id 11 differs and
+            // nulls (8, 9, 10) filter to NULL rather than true/false.
+            assert_filter_ids(&ds, "a = b", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            assert_filter_ids(&ds, "b = a", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            assert_filter_ids(&ds, "a != b", &[11]).await;
+            assert_filter_ids(&ds, "NOT (a = b)", &[11]).await;
+            assert_filter_ids(&ds, "NOT (a != b)", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            // Ordering: every zero pair is equal, so `<`/`>` admit nothing on
+            // zeros and `<=`/`>=` admit all of them. Id 11 (`1` vs `-1`) splits
+            // the strict pair.
+            assert_filter_ids(&ds, "a < b", &[]).await;
+            assert_filter_ids(&ds, "a > b", &[11]).await;
+            assert_filter_ids(&ds, "a <= b", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            assert_filter_ids(&ds, "a >= b", &[0, 1, 2, 3, 4, 5, 6, 7, 11]).await;
+            assert_filter_ids(&ds, "NOT (a < b)", &[0, 1, 2, 3, 4, 5, 6, 7, 11]).await;
+            // Nested fields go through the same float-width rule.
+            assert_filter_ids(&ds, "s.x = s.y", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            assert_filter_ids(&ds, "s.x != s.y", &[11]).await;
+            assert_filter_ids(&ds, "s.x <= s.y", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            assert_filter_ids(&ds, "s.x > s.y", &[11]).await;
+            // Swapped schema positions answer the same way.
+            assert_filter_ids(&ds, "s.y = s.x", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            assert_filter_ids(&ds, "b * 1.0 = a", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            // Computed operands name the same zeros: `* 1.0` preserves signed
+            // zero, so the answer matches the bare-column case.
+            assert_filter_ids(&ds, "a * 1.0 = b", &[0, 1, 2, 3, 4, 5, 6, 7]).await;
+            assert_filter_ids(&ds, "a * 1.0 != b", &[11]).await;
+            assert_filter_ids(&ds, "a * 1.0 < b", &[]).await;
+            assert_filter_ids(&ds, "a * 1.0 > b", &[11]).await;
+        })
+        .await
+}
+
 #[tokio::test]
 #[rstest::rstest]
 #[case::date32(DataType::Date32)]
@@ -788,4 +996,51 @@ async fn test_zone_map_null_index_used() {
         .await
         .unwrap();
     assert_eq!(non_null_batch.num_rows(), 6);
+}
+
+/// NaNs share the dataset with zeros to prove the zero rewrite does not disturb
+/// them. Same-encoding NaNs compare equal and opposite-sign NaNs order by sign
+/// under Arrow's total order today; making `a = b` match Polars for NaN pairs
+/// (including sign-insensitive equality) is #9315 and is pinned, not changed,
+/// here.
+#[tokio::test]
+async fn test_query_float_column_zero_with_nans_pinned() {
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])) as ArrayRef,
+        ),
+        (
+            "a",
+            Arc::new(Float64Array::from(vec![
+                Some(-0.0),
+                Some(f64::NAN),
+                Some(f64::from_bits(0xFFF8000000000000u64)),
+                None,
+            ])) as ArrayRef,
+        ),
+        (
+            "b",
+            Arc::new(Float64Array::from(vec![
+                Some(0.0),
+                Some(f64::NAN),
+                Some(f64::NAN),
+                None,
+            ])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    DatasetTestCases::from_data(batch)
+        .with_index_types("a", [None])
+        .run(|ds: Dataset, _original: RecordBatch| async move {
+            // Zero pair fixed alongside NaNs; same-NaN equality and
+            // opposite-sign NaN ordering are today's total-order answers.
+            assert_filter_ids(&ds, "a = b", &[0, 1]).await;
+            assert_filter_ids(&ds, "a != b", &[2]).await;
+            assert_filter_ids(&ds, "a < b", &[2]).await;
+            assert_filter_ids(&ds, "a <= b", &[0, 1, 2]).await;
+            assert_filter_ids(&ds, "a > b", &[]).await;
+            assert_filter_ids(&ds, "a >= b", &[0, 1]).await;
+        })
+        .await
 }
