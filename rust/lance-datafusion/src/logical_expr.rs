@@ -6,7 +6,7 @@
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
-use crate::numeric_coercion::{rewrite_binary, try_rewrite_between_expr, try_rewrite_in_list_expr};
+use crate::numeric_coercion::rewrite as rewrite_numeric;
 use datafusion::logical_expr::{Between, ScalarUDFImpl};
 use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::prelude::*;
@@ -79,6 +79,9 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
 /// - *expr*: a datafusion logical expression
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
+    if let Some(rewritten) = rewrite_numeric(expr, schema) {
+        return Ok(rewritten);
+    }
     match expr {
         Expr::Between(Between {
             expr: inner_expr,
@@ -86,15 +89,6 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             high,
             negated,
         }) => {
-            if let Some(rewritten) = try_rewrite_between_expr(
-                inner_expr.as_ref(),
-                low.as_ref(),
-                high.as_ref(),
-                *negated,
-                schema,
-            ) {
-                return Ok(rewritten);
-            }
             if let Some(inner_expr_type) = resolve_column_type(inner_expr.as_ref(), schema) {
                 Ok(Expr::Between(Between {
                     expr: inner_expr.clone(),
@@ -113,10 +107,6 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                     op: *op,
                     right: Box::new(resolve_expr(right.as_ref(), schema)?),
                 }))
-            } else if let Some(rewritten) =
-                rewrite_binary(left.as_ref(), *op, right.as_ref(), schema)
-            {
-                Ok(rewritten)
             } else if let Some(left_type) = resolve_column_type(left.as_ref(), schema) {
                 match right.as_ref() {
                     Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
@@ -150,14 +140,6 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             }
         }
         Expr::InList(in_list) => {
-            if let Some(rewritten) = try_rewrite_in_list_expr(
-                in_list.expr.as_ref(),
-                &in_list.list,
-                in_list.negated,
-                schema,
-            ) {
-                return Ok(rewritten);
-            }
             if matches!(in_list.expr.as_ref(), Expr::Column(_)) {
                 if let Some(resolved_type) = resolve_column_type(in_list.expr.as_ref(), schema) {
                     let resolved_values = in_list
