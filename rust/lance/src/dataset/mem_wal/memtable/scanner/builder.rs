@@ -1472,26 +1472,23 @@ impl MemTableScanner {
             // NaNs out of the memtable fast path without needing a refinement
             // filter after the index lookup.
             Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::And => {
+                // Each side yields exactly one bound, so `xor` keeps a pair of one
+                // lower and one upper bound and rejects two bounds on one side.
                 if let (
-                    Some((left_column, left_lower, left_upper)),
-                    Some((right_column, right_lower, right_upper)),
+                    Some((column, lower, upper)),
+                    Some((other_column, other_lower, other_upper)),
                 ) = (
                     self.extract_btree_range_bound(&binary.left),
                     self.extract_btree_range_bound(&binary.right),
-                ) && left_column == right_column
+                ) && column == other_column
+                    && let (Some(lower), Some(upper)) =
+                        (lower.xor(other_lower), upper.xor(other_upper))
                 {
-                    let bounds = match (left_lower, left_upper, right_lower, right_upper) {
-                        (Some(lower), None, None, Some(upper))
-                        | (None, Some(upper), Some(lower), None) => Some((lower, upper)),
-                        _ => None,
-                    };
-                    if let Some((lower, upper)) = bounds {
-                        return Some(ScalarPredicate::Range {
-                            column: left_column,
-                            lower: Some(lower),
-                            upper: Some(upper),
-                        });
-                    }
+                    return Some(ScalarPredicate::Range {
+                        column,
+                        lower: Some(lower),
+                        upper: Some(upper),
+                    });
                 }
             }
             // `simplify` turns an `IN` list of three or fewer values back into an
