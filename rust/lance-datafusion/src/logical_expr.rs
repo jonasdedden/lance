@@ -429,6 +429,14 @@ mod tests {
         "x = CAST(0.1 AS DOUBLE)",
         col("x").eq(cast(lit(0.1), DataType::Float64))
     )]
+    #[case::overflow(
+        "x > CAST(1e300 AS DOUBLE)",
+        col("x").gt(cast(lit(1e300), DataType::Float64))
+    )]
+    #[case::underflow(
+        "x > CAST(1e-300 AS DOUBLE)",
+        col("x").gt(cast(lit(1e-300), DataType::Float64))
+    )]
     fn test_resolve_double_literal_on_float32(#[case] sql: &str, #[case] expected: Expr) {
         let schema = ArrowSchema::new(vec![Field::new("x", DataType::Float32, true)]);
         let planner = crate::planner::Planner::new(Arc::new(schema));
