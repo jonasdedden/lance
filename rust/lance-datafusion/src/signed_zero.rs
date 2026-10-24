@@ -237,6 +237,8 @@ fn compare_floats_expr(left: Expr, op: Operator, right: Expr) -> Expr {
 /// | `x = 0` / `x = NaN`        | `IN` both sign encodings                        |
 /// | `x IN (0, NaN, ..)`        | missing sign encodings are added                |
 /// | `array_has(xs, 0 / NaN)`   | `array_has_any` over both sign encodings        |
+/// | `x IS NOT DISTINCT FROM 0` | that `IN`, wrapped in `IS TRUE`                 |
+/// | `x IS DISTINCT FROM 0`     | that `IN`, wrapped in `IS NOT TRUE`             |
 ///
 /// The extra NaN range is combined with `AND` for `<`/`<=` and `OR` for `>`/`>=`.
 /// Equality names both encodings because scalar indices key on the bit pattern.
@@ -1276,9 +1278,8 @@ mod tests {
     #[case::not_between("NOT (value >= -1.0 AND value <= 0.0)")]
     #[case::column_comparison("value < other")]
     #[case::array_has("array_has(values, 0.0)")]
-    // `IS [NOT] DISTINCT FROM` is missing because `Planner::parse_filter` rejects
-    // it as unsupported SQL; that arm is reachable only from a programmatically
-    // built expression, and `rewriting_twice_changes_nothing` covers it there.
+    #[case::is_not_distinct_from("value IS NOT DISTINCT FROM 0.0")]
+    #[case::is_distinct_from("value IS DISTINCT FROM 0.0")]
     fn optimizing_twice_changes_nothing(#[case] filter: &str) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Float64, true),
