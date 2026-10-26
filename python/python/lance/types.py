@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Union
 
 import pyarrow as pa
 from pyarrow import RecordBatch
@@ -38,9 +38,9 @@ if TYPE_CHECKING:
         ArrowScanner,
         datasets.Dataset,
         datasets.IterableDataset,
-        Mapping[str, Any],
-        Sequence[Mapping[str, Any]],
-        Sequence[BaseModel],
+        dict[str, Any],
+        list[dict[str, Any]],
+        list[BaseModel],
         Iterable[RecordBatch],
     ]
 

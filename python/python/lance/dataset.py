@@ -8324,8 +8324,8 @@ def write_dataset(
         - Pandas DataFrame, Polars DataFrame
         - Pyarrow Table, RecordBatch, Dataset, Scanner, or RecordBatchReader
         - An iterable of Pyarrow RecordBatch (requires ``schema``)
-        - A dict of columns, or a list of row dicts
-        - A list of Pydantic model instances
+        - A dict of columns, or a non-empty list of row dicts
+        - A non-empty list of instances of the same Pydantic model class
         - Huggingface dataset
     uri: str, Path, LanceDataset, or None
         Where to write the dataset to (directory). If a LanceDataset is passed,

@@ -24,4 +24,7 @@ if TYPE_CHECKING:
         lance.dataset("memory://", asof=pd.NaT)
         lance.dataset("memory://", asof=datetime(2026, 1, 1))
         lance.dataset("memory://", asof="2026-01-01")
+        lance.dataset("memory://", version=1)
+        lance.dataset("memory://", version="release")
+        lance.dataset("memory://", asof=1)  # pyright: ignore[reportArgumentType]
         lance.dataset("memory://", asof=object())  # pyright: ignore[reportArgumentType]

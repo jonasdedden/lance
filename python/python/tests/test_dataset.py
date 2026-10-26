@@ -56,6 +56,11 @@ input_data = [
     (None, pa.record_batch([[1.0, 2.0], [20, 30]], names=["a", "b"])),
     (None, pd.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
     (None, pl.DataFrame({"a": [1.0, 2.0], "b": [20, 30]})),
+    (None, pa.dataset.dataset(pa.table({"a": [1.0, 2.0], "b": [20, 30]}))),
+    (
+        None,
+        pa.dataset.dataset(pa.table({"a": [1.0, 2.0], "b": [20, 30]})).scanner(),
+    ),
     (
         input_schema,
         [pa.record_batch([pa.array([1.0, 2.0]), pa.array([20, 30])], names=["a", "b"])],
@@ -567,12 +572,12 @@ def test_asof_checkout(tmp_path: Path):
     ts_3 = datetime.now()
 
     # check that only the first batch is present
-    ds = lance.dataset(base_dir, asof=ts_1)
+    ds = lance.dataset(base_dir, asof=pd.Timestamp(ts_1))
     assert ds.version == 1
     assert len(ds.to_table()) == 3
 
     # check that the first and second batch are present
-    ds = lance.dataset(base_dir, asof=ts_2)
+    ds = lance.dataset(base_dir, asof=ts_2.isoformat())
     assert ds.version == 2
     assert len(ds.to_table()) == 6
 
@@ -580,6 +585,12 @@ def test_asof_checkout(tmp_path: Path):
     ds = lance.dataset(base_dir, asof=ts_3)
     assert ds.version == 3
     assert len(ds.to_table()) == 9
+
+    with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
+        lance.dataset(base_dir, asof=pd.NaT)
+
+    # An explicit version takes precedence over the timestamp cutoff.
+    assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
 
 
 @pytest.mark.parametrize(

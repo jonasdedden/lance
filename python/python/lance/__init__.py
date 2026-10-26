@@ -167,6 +167,9 @@ def dataset(
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given
         argument value. If a version is already specified, this arg is ignored.
+        Pandas timestamps are accepted, but ``pandas.NaT`` raises ``ValueError``.
+        Strings use pandas parsing when installed; otherwise they must match
+        ``YYYY-MM-DD HH:MM:SS``. Use ``version`` for version numbers or tags.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
     commit_lock : optional, lance.commit.CommitLock
