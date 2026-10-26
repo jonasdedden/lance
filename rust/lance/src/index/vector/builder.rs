@@ -41,7 +41,6 @@ use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::hnsw::HNSW;
-use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -1782,17 +1781,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                     storage_ivf.add_partition(0);
                     index_ivf.add_partition(0);
-                    // An empty HNSW partition must still round-trip through
-                    // `read_sub_index_batch` with parseable `lance:hnsw` metadata
-                    // (see `remap_hnsw_partition`); an empty string there panics.
-                    if S::name() == HNSW::name() {
-                        partition_index_metadata.push(
-                            serde_json::to_string(&HnswMetadata::default())
-                                .expect("valid HnswMetadata always serializes"),
-                        );
-                    } else {
-                        partition_index_metadata.push(String::new());
-                    }
+                    // Sub-indexes that need per-partition metadata on disk
+                    // (HNSW) serialize it here; it must carry the segment's
+                    // build parameters, not type defaults.
+                    partition_index_metadata.push(
+                        S::empty_partition_metadata(self.sub_index_params.as_ref())
+                            .unwrap_or_default(),
+                    );
 
                     continue;
                 };
@@ -1856,17 +1851,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let index_batch = index.to_batch()?;
                 if index_batch.num_rows() == 0 {
                     index_ivf.add_partition(0);
-                    // An empty HNSW partition must still round-trip through
-                    // `read_sub_index_batch` with parseable `lance:hnsw` metadata;
-                    // an empty string there panics on read.
-                    if S::name() == HNSW::name() {
-                        partition_index_metadata.push(
-                            serde_json::to_string(&HnswMetadata::default())
-                                .expect("valid HnswMetadata always serializes"),
-                        );
-                    } else {
-                        partition_index_metadata.push(String::new());
-                    }
+                    partition_index_metadata.push(
+                        S::empty_partition_metadata(self.sub_index_params.as_ref())
+                            .unwrap_or_default(),
+                    );
                 } else {
                     index_writer.write_batch(&index_batch).await?;
                     index_ivf.add_partition(index_batch.num_rows() as u32);
@@ -2999,7 +2987,7 @@ fn nearest_candidate<T: ArrowPrimitiveType>(
 where
     T::Native: Dot + L2 + Normalize,
 {
-    let dists = distance_type.arrow_batch_func()(vector, candidate_centroids)?;
+    let dists = distance_type.batch(vector, candidate_centroids)?;
     Ok(dists
         .values()
         .iter()
@@ -3173,10 +3161,10 @@ fn select_reassign_candidates_impl(
     excluded: &HashSet<usize>,
 ) -> Result<(UInt32Array, FixedSizeListArray)> {
     let centroids = ivf.centroids_array().unwrap();
-    let centroid_dists = distance_type.arrow_batch_func()(c0, centroids)?;
+    let centroid_dists = distance_type.batch(c0, centroids)?;
     // Fetch enough neighbors that the exclusions cannot empty the candidate set.
     let fetch = (REASSIGN_RANGE + excluded.len() + 1).min(ivf.num_partitions());
-    let nearest = sort_to_indices(centroid_dists.as_ref(), None, Some(fetch))?;
+    let nearest = sort_to_indices(&centroid_dists, None, Some(fetch))?;
     let filtered_ids = nearest
         .values()
         .iter()
